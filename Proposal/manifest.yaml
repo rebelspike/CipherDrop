@@ -14,18 +14,20 @@ team:
     gwid: "G12345679"
     email: "name@gwu.edu"
     role: engineer
-  - name: "First Last"
-    gwid: "G12345680"
-    email: "name@gwu.edu"
-    role: auditor
+  - name: "Richard Webb"
+    gwid: "G31162428"
+    email: "r.webb1@gwu.edu"
+    role: Architect
 
 application:
-  name: "Your Application Name"
-  menu_item: 1                   # 1-10 from the project page, or "custom"
+  name: "CipherDrop"
+  menu_item: 2                   # 1-10 from the project page, or "custom"
   security_properties:           # list exactly 3 or more from this set:
     - encryption                 #   encryption | accounts | rbac | networking | audit_log
     - accounts
     - audit_log
+    - rbac
+    - networking
 
 checklist:                       # set each to true only when it is actually present
   product_description: false
