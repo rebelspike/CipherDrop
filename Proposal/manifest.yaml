@@ -6,10 +6,10 @@
 milestone: 1
 
 team:
-  - name: "First Last"           # replace with full name
-    gwid: "G12345678"            # replace with your GWID
-    email: "name@gwu.edu"        # replace with your GWU email
-    role: architect              # architect | engineer | auditor
+  - name: "Eric Torres"           # replace with full name
+    gwid: "G3790557"            # replace with your GWID
+    email: "eric.torres@gwmail.gwu.edu"
+    role: auditor              # architect | engineer | auditor
   - name: "First Last"
     gwid: "G12345679"
     email: "name@gwu.edu"
