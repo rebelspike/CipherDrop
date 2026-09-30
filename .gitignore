@@ -1,0 +1,11 @@
+.env
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+data/cipherdrop.db
+data/encrypted/*
+!data/encrypted/.gitkeep
+certs/*.key
+certs/*.pem
+.DS_Store
