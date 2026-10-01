@@ -12,9 +12,15 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
-class FileMetadata(BaseModel):
-    encrypted_filename: str
-    filename_iv: str
-    file_iv: str
-    wrapped_dek: str
-    dek_wrap_iv: str
+class CryptoProfileRequest(BaseModel):
+    public_key_jwk: str = Field(min_length=20, max_length=4096)
+    encrypted_private_key: str = Field(min_length=20, max_length=8192)
+    private_key_iv: str = Field(min_length=8, max_length=128)
+
+class ShareRequest(BaseModel):
+    recipient_username: str = Field(min_length=3, max_length=64)
+    wrapped_dek: str = Field(min_length=20, max_length=8192)
+    dek_wrap_iv: str = Field(min_length=8, max_length=128)
+    encrypted_filename: str = Field(min_length=1, max_length=8192)
+    filename_iv: str = Field(min_length=8, max_length=128)
+    hkdf_salt: str = Field(min_length=8, max_length=128)
