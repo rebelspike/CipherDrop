@@ -4,10 +4,11 @@
 **Team Members:**
 | Name | GWID | Email | Role |
 |---|---|---|---|
-| First Last | G12345678 | name@gwu.edu | Security Architect |
-| First Last | G12345679 | name@gwu.edu | Security Engineer |
+| Richard Webb | G31162428 | r.webb1@gwu.edu | Security Architect |
+| Kamran Ahmad | G37094725 | kamran.ahmad@gwu.edu | Security Engineer |
+| Eric Torres | G3790557 | eric.torres@gwu.edu | Security Auditor |
 
-**Application:** [Name of your application — Menu Item #N or Custom]
+**Application:** [CipherDrop - Menu Item #2]
 
 ---
 
@@ -89,7 +90,7 @@ You may use draw.io, Excalidraw, Mermaid, or a hand-drawn scan.]
 *What must your system always guarantee? State these as invariants.*
 
 1. [No file content is ever stored or transmitted in plaintext. (This literally)]
-2. [Passwords should only be stored as Argon2id hashes, and encryption keys are never unwrapped]
+2. [Passwords should only be stored as Argon2id hashes, and encryption keys are never stored unwrapped]
 3. [A user can never read or modify another users file without being granted access]
 4. [Every file operation should produce an Audit Log]
 5. [Any modification to an Audit Entry should be detectable]
@@ -113,9 +114,9 @@ You may use draw.io, Excalidraw, Mermaid, or a hand-drawn scan.]
 |---|---|---|
 | 1 | An attacker who can intercept network traffic could steal session tokens to impersonate a user. | All traffic over TLS; session tokens are HttpOnly and SameSite=Strict cookies. |
 | 2 | An attacker who gains read access to the database could extract file contents. | Files are encrypted at rest with AES-256-GCM; keys are never stored in the database. |
-| 3 | [An attacker coud brute-force or credential-stuff the login endpoint. | Argon2id makes offline attempts difficult; online attempts are rate-limited; generic error messages.]
-| 4 |[A logged-in user could change a file ID in a request to access another user's file.| Every file request checks the owner or share list server-side, not just that the user is logged in.]
-| 5 |[An attacker with database write access could edit or delete audit entries to hide their actions. | The audit log is hash-chained, so any change would be noticeable AND break the verification.]
+| 3 | An attacker who can repeatedly submit login requests could brute-force or credential-stuff passwords to compromise user accounts. | Argon2id makes offline attempts difficult; online attempts are rate-limited; generic error messages.|
+| 4 | A logged-in user could change a file ID in a request to access another user's file.| Every file request checks the owner or share list server-side, not just that the user is logged in.|
+| 5 | An attacker with database write access could edit or delete audit entries to hide their actions. | The audit log is hash-chained, so any change would be noticeable AND break the verification.|
 
 ### Agentic Coding Plan
 

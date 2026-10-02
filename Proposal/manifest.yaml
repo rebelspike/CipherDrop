@@ -10,9 +10,9 @@ team:
     gwid: "G3790557"            # replace with your GWID
     email: "eric.torres@gwmail.gwu.edu"
     role: auditor              # architect | engineer | auditor
-  - name: "First Last"
-    gwid: "G12345679"
-    email: "name@gwu.edu"
+  - name: "Kamran Ahmad"
+    gwid: "G37094725"
+    email: "k.ahmad@gwu.edu"
     role: engineer
   - name: "Richard Webb"
     gwid: "G31162428"
@@ -30,9 +30,9 @@ application:
     - networking
 
 checklist:                       # set each to true only when it is actually present
-  product_description: false
-  timeline: false
-  visual_mockups: false
-  threat_model: false
-  architecture_diagram: false
-  agentic_plan: false
+  product_description: true
+  timeline: true
+  visual_mockups: true
+  threat_model: true
+  architecture_diagram: true
+  agentic_plan: true
