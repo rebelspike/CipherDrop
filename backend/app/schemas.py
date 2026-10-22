@@ -1,4 +1,5 @@
-from pydantic import BaseModel, Field
+from datetime import datetime
+from pydantic import BaseModel, Field, model_validator
 
 class RegisterRequest(BaseModel):
     username: str = Field(min_length=3, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
@@ -24,3 +25,16 @@ class ShareRequest(BaseModel):
     encrypted_filename: str = Field(min_length=1, max_length=8192)
     filename_iv: str = Field(min_length=8, max_length=128)
     hkdf_salt: str = Field(min_length=8, max_length=128)
+    can_view: bool = True
+    can_download: bool = True
+    can_reshare: bool = False
+    expires_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_permissions(self):
+        if self.can_download or self.can_reshare:
+            self.can_view = True
+        return self
+
+class ReshareRequest(ShareRequest):
+    pass

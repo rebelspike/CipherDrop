@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import String, Integer, DateTime, ForeignKey, Text, UniqueConstraint
+from sqlalchemy import String, Integer, DateTime, ForeignKey, Text, UniqueConstraint, Boolean
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .database import Base
 
@@ -63,4 +63,10 @@ class FileShare(Base):
     encrypted_filename: Mapped[str] = mapped_column(Text)
     filename_iv: Mapped[str] = mapped_column(Text)
     hkdf_salt: Mapped[str] = mapped_column(Text)
+    grantor_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    parent_share_id: Mapped[int | None] = mapped_column(ForeignKey("file_shares.id"), nullable=True, index=True)
+    can_view: Mapped[bool] = mapped_column(Boolean, default=True)
+    can_download: Mapped[bool] = mapped_column(Boolean, default=True)
+    can_reshare: Mapped[bool] = mapped_column(Boolean, default=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
