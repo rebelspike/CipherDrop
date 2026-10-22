@@ -9,12 +9,12 @@ from argon2.exceptions import VerifyMismatchError
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session as DBSession
 
 from .database import Base, engine, get_db
 from .models import User, Session, FileRecord, UserCryptoProfile, FileShare
-from .schemas import RegisterRequest, LoginRequest, CryptoProfileRequest, ShareRequest
+from .schemas import RegisterRequest, LoginRequest, CryptoProfileRequest, ShareRequest, ReshareRequest
 
 ROOT = Path(__file__).resolve().parents[2]
 STORAGE = ROOT / "data" / "encrypted"
@@ -24,7 +24,7 @@ SESSION_HOURS = 12
 MAX_FILE_BYTES = 100 * 1024 * 1024
 ph = PasswordHasher()
 
-app = FastAPI(title="CipherDrop API", version="0.3.0")
+app = FastAPI(title="CipherDrop API", version="0.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -36,6 +36,23 @@ app.add_middleware(
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(bind=engine)
+    # Lightweight SQLite migration for pre-v0.4 development databases.
+    # SQLAlchemy create_all() creates new tables but does not add columns to existing ones.
+    if engine.dialect.name == "sqlite":
+        with engine.begin() as conn:
+            cols = {row[1] for row in conn.execute(text("PRAGMA table_info(file_shares)"))}
+            additions = {
+                "grantor_id": "INTEGER",
+                "parent_share_id": "INTEGER",
+                "can_view": "BOOLEAN NOT NULL DEFAULT 1",
+                "can_download": "BOOLEAN NOT NULL DEFAULT 1",
+                "can_reshare": "BOOLEAN NOT NULL DEFAULT 0",
+                "expires_at": "DATETIME",
+            }
+            for name, ddl in additions.items():
+                if name not in cols:
+                    conn.execute(text(f"ALTER TABLE file_shares ADD COLUMN {name} {ddl}"))
+            conn.execute(text("UPDATE file_shares SET grantor_id = owner_id WHERE grantor_id IS NULL"))
 
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
@@ -67,7 +84,7 @@ def create_session(response: Response, user: User, db: DBSession):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": "0.3.0"}
+    return {"status": "ok", "version": "0.4.0"}
 
 @app.post("/api/auth/register", status_code=201)
 def register(body: RegisterRequest, response: Response, db: DBSession = Depends(get_db)):
@@ -255,6 +272,39 @@ def recipient_public_key(username: str, user: User = Depends(current_user), db: 
         raise HTTPException(409, "Recipient has not initialized encrypted sharing")
     return {"username": target.username, "public_key_jwk": profile.public_key_jwk}
 
+def _is_expired(share: FileShare) -> bool:
+    if not share.expires_at:
+        return False
+    expiry = share.expires_at
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return expiry <= datetime.now(timezone.utc)
+
+def _delete_share_tree(db: DBSession, share: FileShare):
+    children = db.scalars(select(FileShare).where(FileShare.parent_share_id == share.id)).all()
+    for child in children:
+        _delete_share_tree(db, child)
+    db.delete(share)
+
+def _share_payload(share: FileShare, db: DBSession):
+    file_row = db.get(FileRecord, share.file_id)
+    owner = db.get(User, share.owner_id)
+    grantor = db.get(User, share.grantor_id or share.owner_id)
+    grantor_profile = db.scalar(select(UserCryptoProfile).where(UserCryptoProfile.user_id == (share.grantor_id or share.owner_id)))
+    if not file_row or not owner or not grantor or not grantor_profile:
+        return None
+    return {
+        "id": share.id, "file_id": file_row.id,
+        "owner_username": owner.username, "grantor_username": grantor.username,
+        "sender_public_key_jwk": grantor_profile.public_key_jwk,
+        "encrypted_filename": share.encrypted_filename, "filename_iv": share.filename_iv,
+        "file_iv": file_row.file_iv, "wrapped_dek": share.wrapped_dek,
+        "dek_wrap_iv": share.dek_wrap_iv, "hkdf_salt": share.hkdf_salt,
+        "size_bytes": file_row.size_bytes, "created_at": share.created_at,
+        "can_view": bool(share.can_view), "can_download": bool(share.can_download),
+        "can_reshare": bool(share.can_reshare), "expires_at": share.expires_at,
+    }
+
 @app.post("/api/files/{file_id}/shares", status_code=201)
 def create_share(file_id: int, body: ShareRequest, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
     file_row = db.scalar(select(FileRecord).where(FileRecord.id == file_id, FileRecord.owner_id == user.id))
@@ -269,47 +319,96 @@ def create_share(file_id: int, body: ShareRequest, user: User = Depends(current_
     existing = db.scalar(select(FileShare).where(FileShare.file_id == file_id, FileShare.recipient_id == recipient.id))
     if existing:
         raise HTTPException(409, "File is already shared with this user")
+    if body.expires_at and body.expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(400, "Expiration must be in the future")
     share = FileShare(
-        file_id=file_id, owner_id=user.id, recipient_id=recipient.id,
+        file_id=file_id, owner_id=user.id, recipient_id=recipient.id, grantor_id=user.id,
         wrapped_dek=body.wrapped_dek, dek_wrap_iv=body.dek_wrap_iv,
         encrypted_filename=body.encrypted_filename, filename_iv=body.filename_iv,
-        hkdf_salt=body.hkdf_salt,
+        hkdf_salt=body.hkdf_salt, can_view=body.can_view, can_download=body.can_download,
+        can_reshare=body.can_reshare, expires_at=body.expires_at,
     )
-    db.add(share)
-    db.commit()
-    db.refresh(share)
+    db.add(share); db.commit(); db.refresh(share)
     return {"id": share.id, "recipient": recipient.username}
+
+@app.get("/api/files/{file_id}/shares")
+def manage_file_shares(file_id: int, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    file_row = db.scalar(select(FileRecord).where(FileRecord.id == file_id, FileRecord.owner_id == user.id))
+    if not file_row:
+        raise HTTPException(404, "File not found")
+    shares = db.scalars(select(FileShare).where(FileShare.file_id == file_id, FileShare.owner_id == user.id).order_by(FileShare.created_at.desc())).all()
+    result = []
+    for share in shares:
+        recipient = db.get(User, share.recipient_id)
+        grantor = db.get(User, share.grantor_id or share.owner_id)
+        if recipient and grantor:
+            result.append({
+                "id": share.id, "recipient_username": recipient.username,
+                "grantor_username": grantor.username, "can_view": bool(share.can_view),
+                "can_download": bool(share.can_download), "can_reshare": bool(share.can_reshare),
+                "expires_at": share.expires_at, "expired": _is_expired(share),
+                "created_at": share.created_at, "is_direct": share.parent_share_id is None,
+            })
+    return result
+
+@app.delete("/api/files/{file_id}/shares/{share_id}", status_code=204)
+def revoke_share(file_id: int, share_id: int, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    file_row = db.scalar(select(FileRecord).where(FileRecord.id == file_id, FileRecord.owner_id == user.id))
+    if not file_row:
+        raise HTTPException(404, "File not found")
+    share = db.scalar(select(FileShare).where(FileShare.id == share_id, FileShare.file_id == file_id, FileShare.owner_id == user.id))
+    if not share:
+        raise HTTPException(404, "Share not found")
+    _delete_share_tree(db, share)
+    db.commit()
 
 @app.get("/api/shared")
 def shared_with_me(user: User = Depends(current_user), db: DBSession = Depends(get_db)):
-    shares = db.scalars(select(FileShare).where(FileShare.recipient_id == user.id).order_by(FileShare.created_at.desc())).all()
+    shares = db.scalars(select(FileShare).where(FileShare.recipient_id == user.id, FileShare.can_view == True).order_by(FileShare.created_at.desc())).all()
     result = []
     for share in shares:
-        file_row = db.get(FileRecord, share.file_id)
-        owner = db.get(User, share.owner_id)
-        owner_profile = db.scalar(select(UserCryptoProfile).where(UserCryptoProfile.user_id == share.owner_id))
-        if not file_row or not owner or not owner_profile:
+        if _is_expired(share):
             continue
-        result.append({
-            "id": share.id,
-            "file_id": file_row.id,
-            "owner_username": owner.username,
-            "sender_public_key_jwk": owner_profile.public_key_jwk,
-            "encrypted_filename": share.encrypted_filename,
-            "filename_iv": share.filename_iv,
-            "file_iv": file_row.file_iv,
-            "wrapped_dek": share.wrapped_dek,
-            "dek_wrap_iv": share.dek_wrap_iv,
-            "hkdf_salt": share.hkdf_salt,
-            "size_bytes": file_row.size_bytes,
-            "created_at": share.created_at,
-        })
+        payload = _share_payload(share, db)
+        if payload:
+            result.append(payload)
     return result
+
+@app.post("/api/shared/{share_id}/reshare", status_code=201)
+def reshare_file(share_id: int, body: ReshareRequest, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    parent = db.scalar(select(FileShare).where(FileShare.id == share_id, FileShare.recipient_id == user.id))
+    if not parent or _is_expired(parent) or not parent.can_reshare:
+        raise HTTPException(404, "Share not found")
+    recipient = db.scalar(select(User).where(User.username == body.recipient_username.strip().lower()))
+    if not recipient or recipient.id in {user.id, parent.owner_id}:
+        raise HTTPException(404, "Recipient not found")
+    profile = db.scalar(select(UserCryptoProfile).where(UserCryptoProfile.user_id == recipient.id))
+    if not profile:
+        raise HTTPException(409, "Recipient has not initialized encrypted sharing")
+    existing = db.scalar(select(FileShare).where(FileShare.file_id == parent.file_id, FileShare.recipient_id == recipient.id))
+    if existing:
+        raise HTTPException(409, "File is already shared with this user")
+    expires_at = body.expires_at
+    if parent.expires_at and (expires_at is None or expires_at > parent.expires_at.replace(tzinfo=timezone.utc)):
+        expires_at = parent.expires_at.replace(tzinfo=timezone.utc)
+    if expires_at and expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(400, "Expiration must be in the future")
+    child = FileShare(
+        file_id=parent.file_id, owner_id=parent.owner_id, recipient_id=recipient.id,
+        grantor_id=user.id, parent_share_id=parent.id,
+        wrapped_dek=body.wrapped_dek, dek_wrap_iv=body.dek_wrap_iv,
+        encrypted_filename=body.encrypted_filename, filename_iv=body.filename_iv,
+        hkdf_salt=body.hkdf_salt, can_view=body.can_view,
+        can_download=body.can_download and parent.can_download,
+        can_reshare=body.can_reshare and parent.can_reshare, expires_at=expires_at,
+    )
+    db.add(child); db.commit(); db.refresh(child)
+    return {"id": child.id, "recipient": recipient.username}
 
 @app.get("/api/shared/{share_id}/blob")
 def download_shared_blob(share_id: int, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
     share = db.scalar(select(FileShare).where(FileShare.id == share_id, FileShare.recipient_id == user.id))
-    if not share:
+    if not share or _is_expired(share) or not share.can_download:
         raise HTTPException(404, "Shared file not found")
     file_row = db.get(FileRecord, share.file_id)
     if not file_row:
