@@ -16,12 +16,13 @@ This file is read by the autograder — accuracy matters.
 I am working on a university security course project. Here is my team's information:
 
 Team members:
-- [Name], GWID [G12345678], email [name@gwu.edu], role: [architect/engineer/auditor]
-- [Name], GWID [G12345679], email [name@gwu.edu], role: [engineer]
+- [Eric Torres], GWID [G3790557], email [eric.torres@gwu.edu], role: [auditor]
+- [Kamran Ahmad], GWID [G37094725], email [k.ahmad@gwu.edu], role: [engineer]
+- [Richard Webb], GWID [G31162428], email [r.webb1@gwu.edu], role: [auditor]
 
-We are building: [brief description — e.g., "a password manager web app"]
-from menu item [#] on the project page.
-Our three security properties are: [encryption, accounts, audit_log]
+We are building: [An end - to - end encrypted, audited, logged, file storage that can be controlled and shared]
+from menu item [2] on the project page.
+Our three security properties are: [encryption, accounts, audit_log, rbac, and networking]
 
 Please fill in the manifest.yaml template with this information, keeping all
 field names and YAML structure exactly as they are. Set checklist items to true
@@ -36,16 +37,25 @@ only for sections we have actually completed.
 
 ```
 I am writing a project proposal for a university computer security course.
-My team is building: [describe your application — what it does, who uses it,
-what security problem it solves].
+My team is building: [An end to end encyrpted file storage that allows for sharing of files. — What will it do: It will essentially be able to store files with a manner of protective security while also allowing the sharing of said. 
+Who uses it: anybody who needs to send files to another person securely.
+What security problem it solves: Encyrpting files on servers allows only the user, with encryption keys, to look at the file itself even if the server is compromised.]
 
 We will implement these three security properties:
-1. [Property 1] — specifically using [mechanism, e.g., AES-256-GCM via Python cryptography library]
-2. [Property 2] — specifically using [mechanism, e.g., Argon2id via argon2-cffi]
-3. [Property 3] — specifically using [mechanism]
+1. [Encyrption] — specifically using [ AES-256-GCM via Python cryptography library, literally this is what were using (the exact example)]
+2. [Accounts] — specifically using [, Argon2id via argon2-cffi. (This exactly)]
+3. [Audit Log] — specifically using [tamper evident cryptographically chained audit log]
 
 Write Section 1 (Product Description) of our proposal. It should be 2–3 paragraphs,
 written for a technical audience (computer science students and instructor), and explain:
+
+The application will store and manage files, doing end-to-end encyrption using AES-256-GCM via Python cryptographic library, in order to protect and prevent attacks on the database from influencing the files stored there. This protection will also allow for the safe and secure sending of files to persons of interest without worry that they will be intercepted, as even if intercepted the data will be encyrpted and thus impossible to obtain.
+
+The application will use accounts, specifically using Argon2id via argon2-cffi, in order to allow the user to upload files that only they can see while maintaining confidentiality and allowing for only authorized users to see their specific files.
+
+The application will then use a tamper evident cryptographically chained audit log to check exactly what damage was done from an attack and store information about every change to a file, what could have potentially been compromised, and ensure users are only authorized to access their files and nobody elses. 
+
+This is a meaningful security appliaction as the application is ensuring that files are easily accessible to their authorized user while maintaining confidentiality and privacy for the one who has the files, a big problem of todays society is hackers being able to attack databases and steal information. What this application hopes to accomplish is the ability to prevent file information from being stolen by encrypting them, ensuring security.
 - What the application does and who it is for
 - Which security properties we implement and exactly how (be specific about algorithms
   and libraries, not just "encryption")

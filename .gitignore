@@ -9,3 +9,13 @@ data/encrypted/*
 certs/*.key
 certs/*.pem
 .DS_Store
+logins.md
+
+# CipherDrop update backups
+.cipherdrop-update-backups/
+
+# Audit HMAC signing key — NEVER COMMIT
+data/audit_hmac.key
+
+# Generated frontend build
+frontend/dist/
