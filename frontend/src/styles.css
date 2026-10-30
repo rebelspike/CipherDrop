@@ -582,3 +582,6 @@ nav button.active {
 .manage-modal {
   width:min(650px,100%)
 }
+/* v0.7: readable security cards and generated-link field */
+.grant input[readonly] { width: 100%; min-width: 0; background: #080d14; color: #cbd5e1; border: 1px solid #263446; border-radius: 8px; padding: 9px; }
+.grant > div { min-width: 0; flex: 1; }
