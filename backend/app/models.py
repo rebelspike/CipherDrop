@@ -31,6 +31,8 @@ class Session(Base):
     ip_address: Mapped[str] = mapped_column(String(100), default="Unknown")
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
+    step_up_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
 class UserCryptoProfile(Base):
     __tablename__ = "user_crypto_profiles"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -99,3 +101,20 @@ class SecureLink(Base):
     max_downloads: Mapped[int] = mapped_column(Integer, default=1)
     download_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+
+class TrustedDevice(Base):
+    __tablename__ = "trusted_devices"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    label: Mapped[str] = mapped_column(String(200), default="Browser")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+
+class SecurityNotification(Base):
+    __tablename__ = "security_notifications"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    message: Mapped[str] = mapped_column(String(300))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

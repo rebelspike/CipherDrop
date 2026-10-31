@@ -585,3 +585,9 @@ nav button.active {
 /* v0.7: readable security cards and generated-link field */
 .grant input[readonly] { width: 100%; min-width: 0; background: #080d14; color: #cbd5e1; border: 1px solid #263446; border-radius: 8px; padding: 9px; }
 .grant > div { min-width: 0; flex: 1; }
+
+/* Security Center additions */
+.security-overview{padding:22px;margin-bottom:25px;background:#101d2d;border:1px solid #2a4058;border-radius:15px}
+.security-overview h2{margin:0 0 10px}
+.security-overview p{color:#9eb3c9;line-height:1.6}
+.security-overview button{margin-top:12px}

@@ -17,7 +17,7 @@ from sqlalchemy import select, text, update
 from sqlalchemy.orm import Session as DBSession
 
 from .database import Base, engine, get_db
-from .models import User, Session, FileRecord, UserCryptoProfile, FileShare, AuditEvent, SecureLink
+from .models import User, Session, FileRecord, UserCryptoProfile, FileShare, AuditEvent, SecureLink, TrustedDevice, SecurityNotification
 from .schemas import RegisterRequest, LoginRequest, CryptoProfileRequest, ShareRequest, ReshareRequest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -29,13 +29,16 @@ COOKIE_SECURE = os.getenv("CIPHERDROP_COOKIE_SECURE", "false").lower() == "true"
 MAX_FILE_BYTES = 100 * 1024 * 1024
 ph = PasswordHasher()
 
-app = FastAPI(title="CipherDrop API", version="0.7.0")
+PRODUCTION = os.getenv("CIPHERDROP_ENV", "development").lower() == "production"
+if PRODUCTION and not COOKIE_SECURE:
+    raise RuntimeError("Production requires CIPHERDROP_COOKIE_SECURE=true and HTTPS")
+app = FastAPI(title="CipherDrop API", version="1.0.0", docs_url=None if PRODUCTION else "/docs", redoc_url=None if PRODUCTION else "/redoc", openapi_url=None if PRODUCTION else "/openapi.json")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "X-CSRF-Token"],
 )
 
 @app.on_event("startup")
@@ -59,7 +62,7 @@ def startup():
                     conn.execute(text(f"ALTER TABLE file_shares ADD COLUMN {name} {ddl}"))
             conn.execute(text("UPDATE file_shares SET grantor_id = owner_id WHERE grantor_id IS NULL"))
             session_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(sessions)"))}
-            for name, ddl in {"user_agent":"VARCHAR(300) DEFAULT 'Unknown'", "ip_address":"VARCHAR(100) DEFAULT 'Unknown'", "last_seen_at":"DATETIME"}.items():
+            for name, ddl in {"user_agent":"VARCHAR(300) DEFAULT 'Unknown'", "ip_address":"VARCHAR(100) DEFAULT 'Unknown'", "last_seen_at":"DATETIME", "step_up_until":"DATETIME"}.items():
                 if name not in session_cols:
                     conn.execute(text(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}"))
             conn.execute(text("UPDATE sessions SET last_seen_at = created_at WHERE last_seen_at IS NULL"))
@@ -81,6 +84,7 @@ def current_user(request: Request, db: DBSession = Depends(get_db)) -> User:
     if not user:
         raise HTTPException(401, "Authentication required")
     request.state.session_id = row.id
+    request.state.session_row = row
     return user
 
 def create_session(response: Response, user: User, db: DBSession, request: Request):
@@ -89,7 +93,7 @@ def create_session(response: Response, user: User, db: DBSession, request: Reque
     db.add(Session(user_id=user.id, token_hash=hash_token(raw), expires_at=expires, user_agent=request.headers.get("user-agent", "Unknown")[:300], ip_address=request.client.host if request.client else "Unknown", last_seen_at=datetime.now(timezone.utc)))
     db.commit()
     response.set_cookie(
-        SESSION_COOKIE, raw, httponly=True, samesite="lax", secure=COOKIE_SECURE,
+        SESSION_COOKIE, raw, httponly=True, samesite="strict", secure=COOKIE_SECURE,
         max_age=SESSION_HOURS * 3600, path="/"
     )
 
@@ -104,6 +108,33 @@ if not AUDIT_KEY_FILE.exists():
     except FileExistsError:
         pass
 AUDIT_KEY = AUDIT_KEY_FILE.read_bytes()
+CSRF_KEY = hmac.new(AUDIT_KEY, b"cipherdrop-csrf-v1", hashlib.sha256).digest()
+
+def csrf_value(session_token: str) -> str:
+    return hmac.new(CSRF_KEY, session_token.encode(), hashlib.sha256).hexdigest()
+
+@app.middleware("http")
+async def enforce_csrf(request: Request, call_next):
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path.startswith("/api/"):
+        origin = request.headers.get("origin")
+        # Reject a supplied foreign Origin even for unauthenticated endpoints.
+        if origin:
+            from urllib.parse import urlsplit
+            host = request.headers.get("host", "")
+            parsed = urlsplit(origin)
+            expected = f"{parsed.scheme}://{host}"
+            allowed_dev = not PRODUCTION and origin in {"http://localhost:5173", "http://127.0.0.1:5173"}
+            if origin != expected and not allowed_dev:
+                from fastapi.responses import JSONResponse
+                return JSONResponse({"detail":"Cross-origin request denied"}, status_code=403)
+        token = request.cookies.get(SESSION_COOKIE)
+        if token and request.url.path not in {"/api/auth/login", "/api/auth/register"} and not request.url.path.startswith("/api/public/links/"):
+            supplied = request.headers.get("x-csrf-token", "")
+            if not hmac.compare_digest(supplied, csrf_value(token)):
+                from fastapi.responses import JSONResponse
+                return JSONResponse({"detail":"CSRF token required"}, status_code=403)
+    return await call_next(request)
+
 _audit_lock = threading.RLock()
 
 def audit(db: DBSession, user_id: int | None, event: str, resource: str = "", result: str = "success"):
@@ -134,11 +165,12 @@ def verify_audit(db: DBSession):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": "0.7.0"}
+    return {"status": "ok", "version": "1.0.0"}
 
 @app.post("/api/auth/register", status_code=201)
 def register(body: RegisterRequest, response: Response, request: Request, db: DBSession = Depends(get_db)):
     username = body.username.strip().lower()
+    check_login_limit(request, username + ":register")
     if db.scalar(select(User).where(User.username == username)):
         raise HTTPException(409, "Username is unavailable")
     user = User(
@@ -152,12 +184,34 @@ def register(body: RegisterRequest, response: Response, request: Request, db: DB
     db.add(user)
     db.commit()
     db.refresh(user)
+    clear_login_limit(request, username + ":register")
     create_session(response, user, db, request)
-    audit(db, user.id, "SESSION_CREATED"); db.commit()
+    audit(db, user.id, "SESSION_CREATED")
+    db.commit()
     return {"id": user.id, "username": user.username}
+
+_login_attempts: dict[str, list[float]] = {}
+_login_lock = threading.Lock()
+
+def check_login_limit(request: Request, username: str):
+    import time
+    key = f"{request.client.host if request.client else 'unknown'}:{username.strip().lower()}"
+    now = time.monotonic()
+    with _login_lock:
+        recent = [t for t in _login_attempts.get(key, []) if now - t < 300]
+        if len(recent) >= 8:
+            raise HTTPException(429, "Too many login attempts; retry in five minutes")
+        recent.append(now)
+        _login_attempts[key] = recent
+
+def clear_login_limit(request: Request, username: str):
+    key = f"{request.client.host if request.client else 'unknown'}:{username.strip().lower()}"
+    with _login_lock:
+        _login_attempts.pop(key, None)
 
 @app.post("/api/auth/login")
 def login(body: LoginRequest, response: Response, request: Request, db: DBSession = Depends(get_db)):
+    check_login_limit(request, body.username)
     user = db.scalar(select(User).where(User.username == body.username.strip().lower()))
     if not user:
         raise HTTPException(401, "Invalid username or password")
@@ -165,10 +219,15 @@ def login(body: LoginRequest, response: Response, request: Request, db: DBSessio
         ph.verify(user.password_hash, body.password)
     except VerifyMismatchError:
         raise HTTPException(401, "Invalid username or password")
+    clear_login_limit(request, body.username)
     if ph.check_needs_rehash(user.password_hash):
         user.password_hash = ph.hash(body.password)
+    device_token = request.cookies.get("cipherdrop_device", "")
+    known = bool(device_token and db.scalar(select(TrustedDevice).where(TrustedDevice.user_id == user.id, TrustedDevice.token_hash == hash_token(device_token))))
     create_session(response, user, db, request)
-    audit(db, user.id, "SESSION_CREATED"); db.commit()
+    audit(db, user.id, "SESSION_CREATED")
+    notify(db, user.id, "Login from a trusted browser" if known else "New login from an untrusted browser")
+    db.commit()
     return {"id": user.id, "username": user.username}
 
 @app.post("/api/auth/logout", status_code=204)
@@ -185,6 +244,10 @@ def logout(request: Request, response: Response, db: DBSession = Depends(get_db)
 @app.get("/api/auth/me")
 def me(user: User = Depends(current_user)):
     return {"id": user.id, "username": user.username}
+
+@app.get("/api/auth/csrf")
+def csrf_token(request: Request, user: User = Depends(current_user)):
+    return {"token": csrf_value(request.cookies[SESSION_COOKIE])}
 
 @app.get("/api/vault/material")
 def vault_material(user: User = Depends(current_user)):
@@ -494,15 +557,18 @@ def revoke_session(session_id: int, request: Request, user: User = Depends(curre
     if not row:
         raise HTTPException(404, 'Session not found')
     audit(db, user.id, 'SESSION_REVOKED', str(row.id))
+    notify(db, user.id, "A session was revoked")
     db.delete(row)
     db.commit()
 
 @app.post('/api/security/sessions/revoke-others')
 def revoke_other_sessions(request: Request, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    require_step_up(request)
     rows = db.scalars(select(Session).where(Session.user_id == user.id, Session.id != request.state.session_id)).all()
     for row in rows:
         db.delete(row)
     audit(db, user.id, 'OTHER_SESSIONS_REVOKED', str(len(rows)))
+    notify(db, user.id, f'{len(rows)} other sessions were revoked')
     db.commit()
     return {'revoked': len(rows)}
 
@@ -588,3 +654,90 @@ def public_link_download(token: str, db: DBSession = Depends(get_db)):
         db.rollback(); raise HTTPException(404, 'Link unavailable')
     audit(db, link.owner_id, 'LINK_DOWNLOADED', str(link.id)); db.commit()
     return FileResponse(path, media_type='application/octet-stream', filename='encrypted-file.enc')
+
+# v0.8–v1.0 security center and device controls
+from pydantic import BaseModel as _BaseModel
+
+class PasswordConfirmation(_BaseModel):
+    password: str
+
+def require_step_up(request: Request):
+    row = getattr(request.state, "session_row", None)
+    until = row.step_up_until if row else None
+    if until is None or until.replace(tzinfo=timezone.utc) <= datetime.now(timezone.utc):
+        raise HTTPException(403, "Reauthentication required. Confirm your account password in Security Center.")
+
+@app.post("/api/security/step-up")
+def step_up(body: PasswordConfirmation, request: Request, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    check_login_limit(request, user.username + ":stepup")
+    try:
+        if not ph.verify(user.password_hash, body.password):
+            raise HTTPException(401, "Invalid password")
+    except VerifyMismatchError:
+        raise HTTPException(401, "Invalid password")
+    clear_login_limit(request, user.username + ":stepup")
+    request.state.session_row.step_up_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+    audit(db, user.id, "STEP_UP_SUCCESS")
+    db.commit()
+    return {"valid_for_seconds": 300}
+
+@app.get("/api/security/overview")
+def security_overview(request: Request, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    sessions = db.scalars(select(Session).where(Session.user_id == user.id)).all()
+    devices = db.scalars(select(TrustedDevice).where(TrustedDevice.user_id == user.id)).all()
+    unread = db.scalars(select(SecurityNotification).where(SecurityNotification.user_id == user.id, SecurityNotification.read_at.is_(None))).all()
+    return {"sessions": len(sessions), "trusted_devices": len(devices), "unread_notifications": len(unread), "step_up_active": bool(request.state.session_row.step_up_until and request.state.session_row.step_up_until.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc))}
+
+DEVICE_COOKIE = "cipherdrop_device"
+
+def notify(db: DBSession, user_id: int, message: str):
+    db.add(SecurityNotification(user_id=user_id, message=message[:300]))
+
+@app.post("/api/security/devices/trust", status_code=201)
+def trust_device(request: Request, response: Response, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    require_step_up(request)
+    old = request.cookies.get(DEVICE_COOKIE)
+    if old:
+        previous = db.scalar(select(TrustedDevice).where(TrustedDevice.user_id == user.id, TrustedDevice.token_hash == hash_token(old)))
+        if previous:
+            db.delete(previous)
+            db.flush()
+    token = secrets.token_urlsafe(32)
+    device = TrustedDevice(user_id=user.id, token_hash=hash_token(token), label=request.headers.get("user-agent", "Browser")[:200])
+    db.add(device)
+    audit(db, user.id, "DEVICE_TRUSTED")
+    notify(db, user.id, "A browser was marked as trusted")
+    db.commit()
+    response.set_cookie(DEVICE_COOKIE, token, httponly=True, secure=COOKIE_SECURE, samesite="strict", max_age=60*60*24*90, path="/")
+    return {"id": device.id}
+
+@app.get("/api/security/devices")
+def list_devices(request: Request, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    token = request.cookies.get(DEVICE_COOKIE, "")
+    rows = db.scalars(select(TrustedDevice).where(TrustedDevice.user_id == user.id).order_by(TrustedDevice.created_at.desc())).all()
+    return [{"id": x.id, "label": x.label, "created_at": x.created_at, "current": bool(token and hmac.compare_digest(x.token_hash, hash_token(token)))} for x in rows]
+
+@app.delete("/api/security/devices/{device_id}", status_code=204)
+def untrust_device(device_id: int, request: Request, response: Response, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    require_step_up(request)
+    row = db.scalar(select(TrustedDevice).where(TrustedDevice.id == device_id, TrustedDevice.user_id == user.id))
+    if not row:
+        raise HTTPException(404, "Device not found")
+    current = request.cookies.get(DEVICE_COOKIE, "")
+    if current and hmac.compare_digest(row.token_hash, hash_token(current)):
+        response.delete_cookie(DEVICE_COOKIE, path="/")
+    db.delete(row)
+    audit(db, user.id, "DEVICE_UNTRUSTED")
+    notify(db, user.id, "A trusted browser was removed")
+    db.commit()
+
+@app.get("/api/security/notifications")
+def notifications(user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    rows = db.scalars(select(SecurityNotification).where(SecurityNotification.user_id == user.id).order_by(SecurityNotification.id.desc()).limit(50)).all()
+    return [{"id": r.id, "message": r.message, "created_at": r.created_at, "read": r.read_at is not None} for r in rows]
+
+@app.post("/api/security/notifications/read")
+def mark_notifications_read(user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    db.execute(update(SecurityNotification).where(SecurityNotification.user_id == user.id, SecurityNotification.read_at.is_(None)).values(read_at=datetime.now(timezone.utc)))
+    db.commit()
+    return {"ok": True}

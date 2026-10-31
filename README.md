@@ -89,3 +89,7 @@ For sharing, the server may store public keys, encrypted private-key blobs, wrap
 7. Run `python -m compileall backend/app` and `cd frontend && npm run build` on the Mac. Do not commit if the frontend build fails.
 
 **Academic integrity:** Threat model, security analysis, and AI reflection must be written by the students, not copied from generated documentation.
+
+## Security Center update (v0.8–v0.9 / v1.0 hardening preview)
+
+This development update adds a Security Center overview, five-minute password step-up for high-impact account actions, trusted-browser management, in-app security alerts, session-bound CSRF tokens, basic single-process login throttling, and production cookie/API-documentation guardrails. **Passkeys/WebAuthn are not yet implemented.** See `SECURITY_UPDATE.md` for setup, tests, and deployment limitations.
