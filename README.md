@@ -93,3 +93,11 @@ For sharing, the server may store public keys, encrypted private-key blobs, wrap
 ## Security Center update (v0.8–v0.9 / v1.0 hardening preview)
 
 This development update adds a Security Center overview, five-minute password step-up for high-impact account actions, trusted-browser management, in-app security alerts, session-bound CSRF tokens, basic single-process login throttling, and production cookie/API-documentation guardrails. **Passkeys/WebAuthn are not yet implemented.** See `SECURITY_UPDATE.md` for setup, tests, and deployment limitations.
+
+### Final feature batch — passkeys, multi-file drop, readable devices
+- Account passkeys use WebAuthn with verified server-generated challenges and public-key signatures. Existing password login remains available. **Passkeys only authenticate the account; the separate vault passphrase must still be entered after login** so existing encryption and key wrapping remain unchanged.
+- Passkeys can be added under Security after using **Confirm password** (5-minute step-up), listed, and removed with a fresh step-up authorization. Use `http://localhost:5173` for local passkeys (not 127.0.0.1) or your configured production HTTPS origin.
+- Vault upload now supports dragging multiple files directly into the upload area and selecting multiple files using the file picker. The status shows encryption/upload stages and file counts (not network byte percentages). Each file must be at most 100 MB.
+- Sessions and trusted devices display readable browser and OS labels instead of entire user-agent strings.
+- `make` performs setup/build, `make run` automatically ensures setup on a fresh clone, and `make clean` removes generated build artifacts without erasing user data. Developer commands `make test` and `make audit` remain available during final validation.
+- The new passkey code depends on `webauthn>=2.5,<3`, which the initial `make` installs. Browser registration/login must be manually tested on a real secure-context browser before declaring WebAuthn fully verified.

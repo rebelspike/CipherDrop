@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, subprocess, secrets, time, signal, shutil
+import os, sys, subprocess, secrets, time, shutil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -38,25 +38,12 @@ def ensure_dependencies():
         run(['npm', 'install'], ROOT/'frontend')
     return py
 
-def menu():
-    print(BANNER)
-    print('How would you like to run CipherDrop?\n')
-    print('[1] Standalone\n    Everything runs on this computer.\n    Recommended for most users.\n')
-    print('[2] Server\n    Host CipherDrop for other devices\n    on your network.\n')
-    print('[3] Development\n    Run frontend/backend separately.\n')
-    print('[Q] Quit\n')
-    return input('Select: ').strip().lower()
-
-def launch(mode, py):
-    api_host = '127.0.0.1' if mode == 'standalone' else '0.0.0.0'
-    reload_flag = ['--reload'] if mode == 'development' else []
-    api = subprocess.Popen([str(py), '-m', 'uvicorn', 'app.main:app', '--host', api_host, '--port', '8000', *reload_flag], cwd=ROOT/'backend')
-    web_host = '127.0.0.1' if mode == 'standalone' else '0.0.0.0'
-    web = subprocess.Popen(['npm', 'run', 'dev', '--', '--host', web_host], cwd=ROOT/'frontend')
+def launch(py):
+    api = subprocess.Popen([str(py), '-m', 'uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', '8000'], cwd=ROOT/'backend')
+    web = subprocess.Popen(['npm', 'run', 'dev', '--', '--host', '127.0.0.1'], cwd=ROOT/'frontend')
     print('\n[✓] CipherDrop services launched')
     print('[→] Web UI: http://localhost:5173')
     print('[→] API:    http://localhost:8000')
-    if mode == 'server': print('[i] Server mode is LAN-visible but TLS is NOT implemented yet; use only on a trusted development network.')
     print('[i] Press Ctrl+C to stop CipherDrop.\n')
     try:
         while api.poll() is None and web.poll() is None: time.sleep(.5)
@@ -71,12 +58,16 @@ def launch(mode, py):
         print('\n[✓] CipherDrop stopped')
 
 def main():
-    choice = menu(); modes={'1':'standalone','2':'server','3':'development'}
-    if choice in ('q','quit','exit'): return 0
-    if choice not in modes: print('\n[!] Invalid selection.'); return 1
-    mode=modes[choice]; ensure_env(mode)
-    try: py=ensure_dependencies()
-    except subprocess.CalledProcessError as e: print(f'[!] Setup failed: {e}'); return 1
-    print(f'\n[✓] Mode selected: {mode.title()}')
-    launch(mode, py); return 0
-if __name__ == '__main__': raise SystemExit(main())
+    print(BANNER)
+    print('[→] Starting CipherDrop in Standalone mode (localhost only)')
+    ensure_env('standalone')
+    try:
+        py = ensure_dependencies()
+    except (subprocess.CalledProcessError, OSError) as e:
+        print(f'[!] Setup failed: {e}')
+        return 1
+    launch(py)
+    return 0
+
+if __name__ == '__main__':
+    raise SystemExit(main())

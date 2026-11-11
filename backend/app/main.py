@@ -1,4 +1,6 @@
 import hashlib
+import base64
+from urllib.parse import urlsplit
 import os
 import json
 import hmac
@@ -12,30 +14,32 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import select, text, update
 from sqlalchemy.orm import Session as DBSession
 
 from .database import Base, engine, get_db
-from .models import User, Session, FileRecord, UserCryptoProfile, FileShare, AuditEvent, SecureLink, TrustedDevice, SecurityNotification
+from .models import User, Session, FileRecord, UserCryptoProfile, FileShare, AuditEvent, SecureLink, TrustedDevice, SecurityNotification, AuthAttempt, PasskeyCredential, PasskeyChallenge
 from .schemas import RegisterRequest, LoginRequest, CryptoProfileRequest, ShareRequest, ReshareRequest
 
 ROOT = Path(__file__).resolve().parents[2]
-STORAGE = ROOT / "data" / "encrypted"
+DATA_DIR = Path(os.getenv("CIPHERDROP_DATA_DIR", str(ROOT / "data"))).resolve()
+STORAGE = DATA_DIR / "encrypted"
 STORAGE.mkdir(parents=True, exist_ok=True)
 SESSION_COOKIE = "cipherdrop_session"
 SESSION_HOURS = 12
 COOKIE_SECURE = os.getenv("CIPHERDROP_COOKIE_SECURE", "false").lower() == "true"
+PUBLIC_ORIGIN = os.getenv("CIPHERDROP_PUBLIC_ORIGIN", "").rstrip("/")
 MAX_FILE_BYTES = 100 * 1024 * 1024
 ph = PasswordHasher()
 
 PRODUCTION = os.getenv("CIPHERDROP_ENV", "development").lower() == "production"
-if PRODUCTION and not COOKIE_SECURE:
-    raise RuntimeError("Production requires CIPHERDROP_COOKIE_SECURE=true and HTTPS")
+if PRODUCTION and (not COOKIE_SECURE or not PUBLIC_ORIGIN.startswith("https://")):
+    raise RuntimeError("Production requires CIPHERDROP_COOKIE_SECURE=true and CIPHERDROP_PUBLIC_ORIGIN=https://your-domain")
 app = FastAPI(title="CipherDrop API", version="1.0.0", docs_url=None if PRODUCTION else "/docs", redoc_url=None if PRODUCTION else "/redoc", openapi_url=None if PRODUCTION else "/openapi.json")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=([PUBLIC_ORIGIN] if PRODUCTION else ["http://localhost:5173", "http://127.0.0.1:5173"]),
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["Content-Type", "X-CSRF-Token"],
@@ -88,6 +92,11 @@ def current_user(request: Request, db: DBSession = Depends(get_db)) -> User:
     return user
 
 def create_session(response: Response, user: User, db: DBSession, request: Request):
+    existing = request.cookies.get(SESSION_COOKIE)
+    if existing:
+        previous = db.scalar(select(Session).where(Session.token_hash == hash_token(existing)))
+        if previous:
+            db.delete(previous)
     raw = secrets.token_urlsafe(32)
     expires = datetime.now(timezone.utc) + timedelta(hours=SESSION_HOURS)
     db.add(Session(user_id=user.id, token_hash=hash_token(raw), expires_at=expires, user_agent=request.headers.get("user-agent", "Unknown")[:300], ip_address=request.client.host if request.client else "Unknown", last_seen_at=datetime.now(timezone.utc)))
@@ -98,7 +107,7 @@ def create_session(response: Response, user: User, db: DBSession, request: Reque
     )
 
 
-AUDIT_KEY_FILE = ROOT / "data" / "audit_hmac.key"
+AUDIT_KEY_FILE = DATA_DIR / "audit_hmac.key"
 AUDIT_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
 if not AUDIT_KEY_FILE.exists():
     try:
@@ -114,26 +123,34 @@ def csrf_value(session_token: str) -> str:
     return hmac.new(CSRF_KEY, session_token.encode(), hashlib.sha256).hexdigest()
 
 @app.middleware("http")
-async def enforce_csrf(request: Request, call_next):
+async def security_middleware(request: Request, call_next):
+    # Same-origin protection supplements the session-bound CSRF token.
+    # Production HTTPS terminates at Caddy; the application trusts only the
+    # configured public origin, not arbitrary Host/X-Forwarded-* headers.
     if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path.startswith("/api/"):
         origin = request.headers.get("origin")
-        # Reject a supplied foreign Origin even for unauthenticated endpoints.
         if origin:
             from urllib.parse import urlsplit
-            host = request.headers.get("host", "")
             parsed = urlsplit(origin)
-            expected = f"{parsed.scheme}://{host}"
-            allowed_dev = not PRODUCTION and origin in {"http://localhost:5173", "http://127.0.0.1:5173"}
-            if origin != expected and not allowed_dev:
-                from fastapi.responses import JSONResponse
-                return JSONResponse({"detail":"Cross-origin request denied"}, status_code=403)
+            valid = (origin == PUBLIC_ORIGIN if PRODUCTION else
+                     origin in {"http://localhost:5173", "http://127.0.0.1:5173", "http://testserver"})
+            if not valid or parsed.username or parsed.password:
+                return JSONResponse({"detail": "Cross-origin request denied"}, status_code=403)
+        elif request.headers.get("sec-fetch-site") == "cross-site":
+            return JSONResponse({"detail": "Cross-site request denied"}, status_code=403)
         token = request.cookies.get(SESSION_COOKIE)
         if token and request.url.path not in {"/api/auth/login", "/api/auth/register"} and not request.url.path.startswith("/api/public/links/"):
             supplied = request.headers.get("x-csrf-token", "")
             if not hmac.compare_digest(supplied, csrf_value(token)):
-                from fastapi.responses import JSONResponse
-                return JSONResponse({"detail":"CSRF token required"}, status_code=403)
-    return await call_next(request)
+                return JSONResponse({"detail": "CSRF token required"}, status_code=403)
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Cache-Control"] = "no-store" if request.url.path.startswith("/api/") else "no-cache"
+    if PRODUCTION:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000"
+    return response
 
 _audit_lock = threading.RLock()
 
@@ -190,24 +207,34 @@ def register(body: RegisterRequest, response: Response, request: Request, db: DB
     db.commit()
     return {"id": user.id, "username": user.username}
 
-_login_attempts: dict[str, list[float]] = {}
+# SQLite-backed throttling survives server restarts. It is designed for a
+# single-instance deployment; a replicated deployment needs a shared limiter.
 _login_lock = threading.Lock()
 
+def _attempt_key(scope: str, value: str) -> str:
+    return hmac.new(AUDIT_KEY, f"{scope}:{value}".encode(), hashlib.sha256).hexdigest()
+
 def check_login_limit(request: Request, username: str):
-    import time
-    key = f"{request.client.host if request.client else 'unknown'}:{username.strip().lower()}"
-    now = time.monotonic()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    cutoff = now - timedelta(minutes=5)
+    ip = request.client.host if request.client else "unknown"
+    keys = [(_attempt_key("ip", ip), 40), (_attempt_key("account", username.strip().lower()), 8)]
     with _login_lock:
-        recent = [t for t in _login_attempts.get(key, []) if now - t < 300]
-        if len(recent) >= 8:
-            raise HTTPException(429, "Too many login attempts; retry in five minutes")
-        recent.append(now)
-        _login_attempts[key] = recent
+        with engine.begin() as conn:
+            conn.execute(AuthAttempt.__table__.delete().where(AuthAttempt.created_at < cutoff))
+            for key, limit in keys:
+                count = conn.execute(select(__import__('sqlalchemy').func.count()).select_from(AuthAttempt).where(AuthAttempt.key == key)).scalar_one()
+                if count >= limit:
+                    raise HTTPException(429, "Too many authentication attempts; retry in five minutes")
+            conn.execute(AuthAttempt.__table__.insert(), [{"key": key, "created_at": now} for key, _ in keys])
 
 def clear_login_limit(request: Request, username: str):
-    key = f"{request.client.host if request.client else 'unknown'}:{username.strip().lower()}"
+    # A valid password clears account-specific failures; retain the IP-wide
+    # budget to make account-spraying more expensive.
+    key = _attempt_key("account", username.strip().lower())
     with _login_lock:
-        _login_attempts.pop(key, None)
+        with engine.begin() as conn:
+            conn.execute(AuthAttempt.__table__.delete().where(AuthAttempt.key == key))
 
 @app.post("/api/auth/login")
 def login(body: LoginRequest, response: Response, request: Request, db: DBSession = Depends(get_db)):
@@ -217,7 +244,7 @@ def login(body: LoginRequest, response: Response, request: Request, db: DBSessio
         raise HTTPException(401, "Invalid username or password")
     try:
         ph.verify(user.password_hash, body.password)
-    except VerifyMismatchError:
+    except (VerifyMismatchError, ValueError):
         raise HTTPException(401, "Invalid username or password")
     clear_login_limit(request, body.username)
     if ph.check_needs_rehash(user.password_hash):
@@ -587,10 +614,16 @@ def audit_integrity(user: User = Depends(current_user), db: DBSession = Depends(
 from pydantic import BaseModel, Field
 
 class LinkCreate(BaseModel):
-    encrypted_filename: str
-    filename_iv: str
-    wrapped_dek: str
-    dek_wrap_iv: str
+    @__import__("pydantic").field_validator("expires_at")
+    @classmethod
+    def timezone_required(cls, value):
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("Expiry must include a timezone offset")
+        return value
+    encrypted_filename: str = Field(min_length=1, max_length=8192)
+    filename_iv: str = Field(min_length=8, max_length=128)
+    wrapped_dek: str = Field(min_length=20, max_length=8192)
+    dek_wrap_iv: str = Field(min_length=8, max_length=128)
     expires_at: datetime | None = None
     max_downloads: int = Field(ge=1, le=100)
 
@@ -673,7 +706,7 @@ def step_up(body: PasswordConfirmation, request: Request, user: User = Depends(c
     try:
         if not ph.verify(user.password_hash, body.password):
             raise HTTPException(401, "Invalid password")
-    except VerifyMismatchError:
+    except (VerifyMismatchError, ValueError):
         raise HTTPException(401, "Invalid password")
     clear_login_limit(request, user.username + ":stepup")
     request.state.session_row.step_up_until = datetime.now(timezone.utc) + timedelta(minutes=5)
@@ -741,3 +774,180 @@ def mark_notifications_read(user: User = Depends(current_user), db: DBSession = 
     db.execute(update(SecurityNotification).where(SecurityNotification.user_id == user.id, SecurityNotification.read_at.is_(None)).values(read_at=datetime.now(timezone.utc)))
     db.commit()
     return {"ok": True}
+
+
+# Passkeys authenticate the account, not the separate encrypted vault. The
+# private authenticator key remains on the user's device / passkey provider.
+# WebAuthn protocol parsing and signature verification use py_webauthn.
+class PasskeyBegin(BaseModel):
+    username: str = Field(min_length=3, max_length=64)
+
+class PasskeyFinish(BaseModel):
+    flow: str = Field(min_length=20, max_length=200)
+    credential: dict
+
+class PasskeyRename(BaseModel):
+    label: str = Field(min_length=1, max_length=120)
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
+
+def _from_b64url(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + '=' * (-len(value) % 4))
+
+def _passkey_origin(request: Request) -> tuple[str, str]:
+    # Origin and RP ID must exactly match the browser's effective site.
+    # Only localhost is supported for local WebAuthn testing, never remote HTTP.
+    if PRODUCTION:
+        url = urlsplit(PUBLIC_ORIGIN)
+        if not url.hostname or url.scheme != 'https':
+            raise HTTPException(503, 'Passkeys require a configured HTTPS origin')
+        return PUBLIC_ORIGIN, url.hostname
+    origin = request.headers.get('origin', '')
+    if origin not in ('http://localhost:5173', 'https://localhost'):
+        raise HTTPException(400, 'For local passkeys, open http://localhost:5173 or https://localhost')
+    return origin, 'localhost'
+
+def _webauthn():
+    try:
+        from webauthn import (generate_registration_options, verify_registration_response,
+                             generate_authentication_options, verify_authentication_response,
+                             options_to_json)
+        from webauthn.helpers.structs import (PublicKeyCredentialDescriptor,
+             AuthenticatorSelectionCriteria, UserVerificationRequirement, ResidentKeyRequirement)
+        return (generate_registration_options, verify_registration_response,
+                generate_authentication_options, verify_authentication_response,
+                options_to_json, PublicKeyCredentialDescriptor, AuthenticatorSelectionCriteria,
+                UserVerificationRequirement, ResidentKeyRequirement)
+    except ImportError as error:
+        raise HTTPException(503, 'WebAuthn dependencies are not installed; run make') from error
+
+def _new_passkey_flow(db: DBSession, user_id: int, challenge: bytes, purpose: str,
+                      origin: str, session_hash: str | None = None) -> str:
+    flow = secrets.token_urlsafe(32)
+    db.add(PasskeyChallenge(token_hash=hash_token(flow), user_id=user_id,
+         challenge_b64=_b64url(challenge), purpose=purpose, origin=origin,
+         session_hash=session_hash, expires_at=datetime.now(timezone.utc) + timedelta(minutes=5)))
+    db.commit()
+    return flow
+
+def _consume_passkey_flow(db: DBSession, flow: str, purpose: str, origin: str,
+                          user_id: int | None = None, session_hash: str | None = None):
+    row = db.scalar(select(PasskeyChallenge).where(PasskeyChallenge.token_hash == hash_token(flow)))
+    # Consume challenge BEFORE verification, so retries and races cannot reuse it.
+    if row:
+        result = (row.user_id, _from_b64url(row.challenge_b64))
+        valid = (row.purpose == purpose and row.origin == origin and
+                 row.expires_at.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc) and
+                 (user_id is None or row.user_id == user_id) and
+                 (session_hash is None or row.session_hash == session_hash))
+        db.delete(row)
+        db.commit()
+        if valid:
+            return result
+    raise HTTPException(400, 'Passkey request expired or invalid; try again')
+
+@app.get('/api/security/passkeys')
+def list_passkeys(user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    rows = db.scalars(select(PasskeyCredential).where(PasskeyCredential.user_id == user.id)
+                      .order_by(PasskeyCredential.id.desc())).all()
+    return [{'id': p.id, 'label': p.label, 'created_at': p.created_at} for p in rows]
+
+@app.post('/api/security/passkeys/register/begin')
+def passkey_registration_begin(request: Request, user: User = Depends(current_user),
+                               db: DBSession = Depends(get_db)):
+    require_step_up(request)
+    origin, rp_id = _passkey_origin(request)
+    gen, _, _, _, to_json, descriptor, selection, uv, resident = _webauthn()
+    stored = db.scalars(select(PasskeyCredential).where(PasskeyCredential.user_id == user.id)).all()
+    options = gen(rp_id=rp_id, rp_name='CipherDrop', user_id=str(user.id).encode(),
+                  user_name=user.username,
+                  exclude_credentials=[descriptor(id=_from_b64url(p.credential_id)) for p in stored],
+                  authenticator_selection=selection(user_verification=uv.REQUIRED,
+                                                    resident_key=resident.PREFERRED))
+    token = request.cookies.get(SESSION_COOKIE, '')
+    flow = _new_passkey_flow(db, user.id, options.challenge, 'register', origin, hash_token(token))
+    return {'flow': flow, 'options': json.loads(to_json(options))}
+
+@app.post('/api/security/passkeys/register/finish', status_code=201)
+def passkey_registration_finish(body: PasskeyFinish, request: Request,
+                                user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    require_step_up(request)
+    origin, rp_id = _passkey_origin(request)
+    _, verify, _, _, _, _, _, _, _ = _webauthn()
+    _, challenge = _consume_passkey_flow(db, body.flow, 'register', origin, user.id,
+                                        hash_token(request.cookies[SESSION_COOKIE]))
+    try:
+        result = verify(credential=body.credential, expected_challenge=challenge,
+                        expected_rp_id=rp_id, expected_origin=origin, require_user_verification=True)
+    except Exception as exc:
+        raise HTTPException(400, 'Passkey registration verification failed') from exc
+    encoded_id = _b64url(result.credential_id)
+    if db.scalar(select(PasskeyCredential).where(PasskeyCredential.credential_id == encoded_id)):
+        raise HTTPException(409, 'Passkey already registered')
+    record = PasskeyCredential(user_id=user.id, credential_id=encoded_id,
+                               public_key=_b64url(result.credential_public_key),
+                               sign_count=result.sign_count, label='Passkey')
+    db.add(record); db.flush(); audit(db, user.id, 'PASSKEY_REGISTERED', str(record.id)); db.commit()
+    return {'id': record.id}
+
+@app.post('/api/auth/passkey/begin')
+def passkey_login_begin(body: PasskeyBegin, request: Request, db: DBSession = Depends(get_db)):
+    check_login_limit(request, body.username.strip().lower() + ':passkey')
+    origin, rp_id = _passkey_origin(request)
+    user = db.scalar(select(User).where(User.username == body.username.strip().lower()))
+    credentials = (db.scalars(select(PasskeyCredential).where(PasskeyCredential.user_id == user.id)).all()
+                   if user else [])
+    if not credentials:
+        raise HTTPException(400, 'No passkeys available for this account')
+    _, _, gen, _, to_json, descriptor, _, uv, _ = _webauthn()
+    options = gen(rp_id=rp_id, user_verification=uv.REQUIRED,
+                  allow_credentials=[descriptor(id=_from_b64url(p.credential_id)) for p in credentials])
+    flow = _new_passkey_flow(db, user.id, options.challenge, 'login', origin)
+    return {'flow': flow, 'options': json.loads(to_json(options))}
+
+@app.post('/api/auth/passkey/finish')
+def passkey_login_finish(body: PasskeyFinish, response: Response,
+                         request: Request, db: DBSession = Depends(get_db)):
+    origin, rp_id = _passkey_origin(request)
+    _, _, _, verify, _, _, _, _, _ = _webauthn()
+    user_id, challenge = _consume_passkey_flow(db, body.flow, 'login', origin)
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(401, 'Passkey authentication failed')
+    check_login_limit(request, user.username + ':passkey')
+    raw_id = body.credential.get('rawId')
+    if not isinstance(raw_id, str):
+        raise HTTPException(400, 'Invalid passkey credential')
+    record = db.scalar(select(PasskeyCredential).where(PasskeyCredential.credential_id == raw_id,
+                          PasskeyCredential.user_id == user.id))
+    if not record:
+        raise HTTPException(401, 'Passkey authentication failed')
+    try:
+        verified = verify(credential=body.credential, expected_challenge=challenge,
+                          expected_rp_id=rp_id, expected_origin=origin,
+                          credential_public_key=_from_b64url(record.public_key),
+                          credential_current_sign_count=record.sign_count,
+                          require_user_verification=True)
+    except Exception as exc:
+        raise HTTPException(401, 'Passkey authentication failed') from exc
+    record.sign_count = verified.new_sign_count
+    clear_login_limit(request, user.username + ':passkey')
+    create_session(response, user, db, request)
+    audit(db, user.id, 'PASSKEY_LOGIN', str(record.id))
+    notify(db, user.id, 'Login with a passkey')
+    db.commit()
+    return {'id': user.id, 'username': user.username}
+
+@app.delete('/api/security/passkeys/{credential_id}', status_code=204)
+def delete_passkey(credential_id: int, request: Request,
+                   user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    require_step_up(request)
+    record = db.scalar(select(PasskeyCredential).where(PasskeyCredential.id == credential_id,
+                      PasskeyCredential.user_id == user.id))
+    if not record:
+        raise HTTPException(404, 'Passkey not found')
+    db.delete(record)
+    audit(db, user.id, 'PASSKEY_REMOVED', str(credential_id))
+    notify(db, user.id, 'A passkey was removed')
+    db.commit()

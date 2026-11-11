@@ -1,5 +1,5 @@
 from datetime import datetime
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_validator, field_validator
 
 class RegisterRequest(BaseModel):
     username: str = Field(min_length=3, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
@@ -10,8 +10,8 @@ class RegisterRequest(BaseModel):
     kdf_iterations: int = Field(ge=100_000, le=2_000_000)
 
 class LoginRequest(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=256)
 
 class CryptoProfileRequest(BaseModel):
     public_key_jwk: str = Field(min_length=20, max_length=4096)
@@ -19,6 +19,13 @@ class CryptoProfileRequest(BaseModel):
     private_key_iv: str = Field(min_length=8, max_length=128)
 
 class ShareRequest(BaseModel):
+    @field_validator("expires_at")
+    @classmethod
+    def timezone_required(cls, value):
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("Expiry must include a timezone offset")
+        return value
+
     recipient_username: str = Field(min_length=3, max_length=64)
     wrapped_dek: str = Field(min_length=20, max_length=8192)
     dek_wrap_iv: str = Field(min_length=8, max_length=128)

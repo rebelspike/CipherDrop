@@ -591,3 +591,10 @@ nav button.active {
 .security-overview h2{margin:0 0 10px}
 .security-overview p{color:#9eb3c9;line-height:1.6}
 .security-overview button{margin-top:12px}
+
+/* Final upload UX: keyboard-accessible browse label plus real file-drop feedback. */
+.drop.dragging {border-color:#58a6ff; background:rgba(52,137,214,.17); outline:2px solid #58a6ff; outline-offset:2px;}
+
+/* CipherDrop UI polish: masked reauthentication and centered passkey action */
+.passkey-login-action { display:flex; justify-content:center; margin-top:18px; margin-bottom:10px; }
+.passkey-login-action .download { width:auto; max-width:100%; }
