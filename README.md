@@ -1,103 +1,171 @@
 # CipherDrop
 
-Zero-knowledge-inspired encrypted file vault and controlled sharing platform.
+**Your files. Your keys.** A browser-based encrypted file vault with cryptographic sharing, account security controls, and tamper-evident activity logging.
 
-## Current status — v0.7 development batch (sessions, audit, secure links)
-CipherDrop supports the end-to-end path **Register → Login → Unlock Vault → Encrypt Locally → Store Ciphertext → Share Cryptographically → Enforce Permissions/Expiration → Revoke Access → Decrypt Locally**.
+CipherDrop is a **standalone, localhost-only course project**. The browser encrypts file contents and filenames before upload; the Python backend stores ciphertext and enforces access controls. It is designed to demonstrate multiple security properties, **not** to serve as a production-ready password manager or cloud storage service.
 
-### Security implemented now
-- Account passwords are hashed server-side with Argon2id (`argon2-cffi`).
-- Opaque random session tokens are issued to the browser; only SHA-256 token digests are stored in the database.
-- A random 256-bit vault master key is generated in the browser.
-- The vault master key is wrapped client-side with AES-256-GCM using a KEK derived from the vault passphrase.
-- Every uploaded/replaced file gets a fresh random 256-bit DEK and fresh AES-GCM nonces.
-- File contents and original filenames are encrypted client-side with AES-256-GCM.
-- File DEKs are wrapped client-side; the server stores ciphertext and wrapped key material rather than raw DEKs/plaintext.
-- Each user has a P-256 ECDH sharing key pair. The public key is server-visible; the private key is encrypted client-side under the vault key before storage.
-- Recipient-specific sharing keys are derived client-side with ECDH + HKDF-SHA-256, then used with AES-256-GCM to protect the file DEK and filename for that recipient.
-- Server-side ownership/recipient checks protect file and share endpoints against simple IDOR/BOLA attacks.
-- Owners can replace and delete encrypted files. Replacement generates new client-side key material and revokes existing shares.
+## Quick start (macOS/Linux)
 
-### v0.4 — permissions, expiration, reshare, and revocation
-- Share grants support **View listing**, **Download**, and **Reshare** permissions.
-- Share expiration supports never, 1 hour, 24 hours, 7 days, or a custom date/time.
-- Expired grants are excluded from the recipient's active Shared view and cannot download ciphertext.
-- Owners get **Manage Access** for each file and can revoke individual grants.
-- Revocation is enforced by the backend, not just hidden in the UI.
-- A recipient with Reshare permission can re-wrap the file DEK in the browser for another recipient without exposing the raw DEK to the server.
-- Reshared grants cannot outlive their parent grant and cannot gain permissions the parent did not have.
-- Revoking a grant recursively revokes downstream grants created through it.
-- Existing pre-v0.4 development shares are migrated on SQLite startup with View + Download enabled, Reshare disabled, and no expiration.
+**Prerequisites:** Python **3.11+**, Node.js **20.19+** (including npm), GNU Make, a modern browser, and an internet connection for the initial dependency download. On macOS, Make is available with Apple's Command Line Tools.
 
-### v0.5 — Security sessions
-- **Security** page lists the account's active sessions with user-agent, IP, creation, expiration, and current-session identification.
-- Revoke an individual session or revoke all other sessions. Revocation removes server-side session records immediately.
-- Cookie `Secure` flag is controlled by `CIPHERDROP_COOKIE_SECURE=true` for HTTPS deployments; local HTTP remains the development default.
+In the project folder:
 
-### v0.6 — Security activity and tamper-evident audit
-- Backend emits audit events for session creation/logout/revocation, file upload/replace/delete, share creation/resharing/revocation, and secure-link events.
-- **Activity** displays the latest 150 events for the signed-in user.
-- **Security → Verify chain** checks an HMAC-SHA-256-linked sequence for database-only tampering.
-- Audit HMAC key is generated at `data/audit_hmac.key` (outside the DB) and MUST be backed up separately, protected from source control, and kept secret. Deleting it makes previously recorded events unverifiable.
-- This is a **single-process development implementation**; concurrency across multiple server workers and key compromise are not solved. Do not claim the audit chain protects against full host compromise or log truncation without external checkpoints.
-
-### v0.7 — Secure encrypted links
-- File owner can create a bearer download link with expiration and a maximum download count (1–100), list links, and revoke them.
-- Browser generates a random 256-bit link key, re-wraps the file DEK and encrypts the filename with AES-256-GCM. The key lives in the URL `#fragment` and is not sent as part of ordinary HTTP requests.
-- Backend stores only a SHA-256 hash of the random link token, encrypted metadata, and counters. A public visitor can decrypt locally without an account.
-- Download counter increments using an atomic conditional database update. The counter counts **ciphertext downloads**, not successful human consumption of plaintext; a failed client-side decrypt still consumes a download.
-- Bearer links are transferable: anyone who obtains the full link can download until it expires or is exhausted. Link revocation does not erase already saved copies.
-- Links to a file are removed when the file is replaced or deleted.
-
-## Security behavior already exercised manually
-Development testing has included ciphertext tampering, wrapped-DEK tampering, wrong vault passphrases, unauthorized file GET/PUT/DELETE requests, and unauthorized access to another recipient's share. AES-GCM integrity failures were rejected and tested cross-user object-ID requests were denied.
-
-## Important security boundaries and limitations
-CipherDrop is a course-project security build, **not production ready**. “Zero-knowledge-inspired” is intentionally narrower than claiming complete zero knowledge: stored server-side data alone is designed to be insufficient to decrypt user files, but the web server delivers the JavaScript that performs cryptography. A compromised server could therefore attempt to serve malicious client code.
-
-A **View listing** permission means the recipient may see/decrypt shared-file metadata in the CipherDrop UI; it does not give plaintext file access. **Download** controls retrieval of the encrypted blob needed for normal client-side file decryption. Once a recipient legitimately decrypts/downloads plaintext, later revocation cannot erase copies they already saved. Revocation prevents future access through CipherDrop.
-
-TLS, rate limiting, CSRF hardening, robust multi-process audit coordination, device trust, notifications, passkeys, and a memory-hard browser-side vault KDF remain planned. Server mode should be treated as development-only until TLS is added.
-
-## Quick start
-Requirements: Python 3.11+ and Node.js 20+.
-
-macOS/Linux:
 ```bash
-./start.sh
+make          # Install dependencies and build the frontend
+make run      # Start CipherDrop in standalone mode (no menu)
 ```
 
-Windows PowerShell:
-```powershell
-.\start.ps1
+Open **http://localhost:5173**. Press **Ctrl+C** in the launch terminal to stop the application. `make run` checks/builds missing dependencies on a fresh checkout, so it also works as the initial command, though `make` followed by `make run` is recommended for grading.
+
+**Normal user commands**
+
+| Command | Description |
+| --- | --- |
+| `make` | Install Python/Node dependencies as necessary and build the React frontend |
+| `make run` | Start the localhost-only frontend and API automatically |
+| `make clean` | Remove compiled frontend and caches; **preserve user accounts and encrypted files** |
+
+**Developer-only commands:** `make test` runs backend regression tests; `make audit` checks Python/npm dependencies against vulnerability advisories; `make help` lists available targets. `make clean-all` also removes the virtual environment and Node packages, but **not** application data. These developer targets are optional for someone just running CipherDrop.
+
+The standalone launcher runs a Vite development frontend on `localhost:5173` and FastAPI on `127.0.0.1:8000`. The `make` production build is used by the optional Caddy-based HTTPS setup, **not** by the ordinary standalone Vite server. Do not expose either standalone service to an untrusted network.
+
+For more installation/troubleshooting detail, see [SETUP.md](SETUP.md).
+
+## Features at a glance
+
+| Area | Implemented functionality |
+| --- | --- |
+| Accounts | Registration, Argon2id password hashing, login/logout, passkey login with password fallback |
+| Vault | Separate vault passphrase, browser-side AES-256-GCM encryption/decryption, encrypted filenames |
+| File management | Multi-file picker, drag-and-drop uploads, staged progress feedback, download, replace, delete |
+| Sharing | Recipient-specific cryptographic sharing, permissions, expiration, resharing, recursive revocation |
+| Secure links | Client-decrypted bearer links, download limits, expiration and revocation |
+| Security Center | Session listing/revocation, password reauthentication, passkey management, trusted browsers, notifications |
+| Activity | Event history and HMAC-SHA-256 audit-chain verification |
+| Network protection | Session-bound CSRF tokens, origin checks, persistent login throttling, production secure-cookie/HTTPS configuration |
+
+## Getting started with the application
+
+1. **Register** an account. The account password is used for authentication and is hashed on the server.
+2. **Create/unlock the vault** with a separate vault passphrase. This unlocks encryption key material in the browser.
+3. **Upload files** with the picker or drag-and-drop area. Multiple files are supported, subject to a **100 MB per-file limit**. The UI reports encryption/upload stages rather than exact network-byte percentages.
+4. **Download** an owned file using **Decrypt & Download**. Decryption takes place in the browser.
+5. **Share** an owned file with another registered user. Configure permissions and expiration; the recipient finds it under **Shared**.
+6. **Manage Access** to revoke grants, or create **Secure download links** for people without accounts.
+7. Visit **Security** and **Activity** to manage sessions and credentials, inspect notifications, and verify the audit chain.
+
+### Account passwords, passkeys, and the vault passphrase
+
+These are **different security mechanisms**:
+
+- **Account password** authenticates a user. The backend stores an Argon2id password hash rather than the original password.
+- **Passkey (WebAuthn)** can authenticate an account using a device authenticator, security key, or supported passkey provider. Password sign-in remains available.
+- **Vault passphrase** unlocks client-side encryption material. **A passkey login does not automatically decrypt or unlock the vault**; enter the vault passphrase afterward.
+
+To add a passkey: log in with your password, unlock the vault, open **Security**, use **Confirm password** (a five-minute reauthentication window), then select **Add passkey**. Registered passkeys can be listed and removed there; sensitive changes require recent password confirmation. To sign in later, supply your username and select **Sign in with a passkey**.
+
+**Local passkey origin:** Use **http://localhost:5173**, *not* `http://127.0.0.1:5173`. The application also supports the configured HTTPS origin for WebAuthn. Browser and device support for passkeys is required.
+
+## Encryption and key management
+
+- Files and original filenames are encrypted **in the browser** using **AES-256-GCM** and fresh random nonces.
+- Each new/replaced file uses a random **256-bit data-encryption key (DEK)**. Replacing a file rotates key material and removes existing sharing grants/links.
+- The browser generates a random **vault master key**. File DEKs are wrapped under that key; the vault master key is itself wrapped using a key derived from the user's vault passphrase (PBKDF2-SHA-256).
+- CipherDrop stores ciphertext, encrypted metadata, and wrapped keys rather than intentionally sending plaintext files or unwrapped DEKs to the backend.
+- Per-user **P-256 ECDH** sharing key pairs support recipient-specific access. The encrypted private sharing key is stored server-side; the browser uses **ECDH + HKDF-SHA-256 + AES-GCM** to wrap material for an authorized recipient.
+- AES-GCM authentication causes decryption to fail when the ciphertext or authentication tag is modified.
+
+**Security model:** CipherDrop is *zero-knowledge-inspired*, not a proven zero-knowledge system. The server serves the JavaScript that performs encryption, so a compromised server could distribute malicious code. The server also sees account, ownership, share, event, and timing metadata. Browser-side key derivation and memory handling have not been independently audited.
+
+## File permissions and sharing
+
+**Owned files:** Upload, list, decrypt/download, replace, delete, share and manage grants.
+
+**Recipient permissions:**
+
+- **View:** See the authorized file listing and decrypt associated filename metadata in the UI.
+- **Download:** Retrieve ciphertext and decrypt the shared file in the browser.
+- **Reshare:** Re-wrap the file key for another recipient, subject to the original grant's limits.
+
+Grant expiration options include **1 hour, 24 hours, 7 days, a custom date/time, or no expiration**. Child grants cannot exceed parent permissions or expiration. Owners can revoke grants, including downstream grants created through resharing. Backend authorization checks protect file/blob and shared-file endpoints; access must not depend on simply hiding UI buttons.
+
+**Limits of revocation:** Revoking a grant prevents *future access through CipherDrop*; it cannot erase copies previously downloaded or decrypted by a recipient.
+
+### Secure download links
+
+Owners may create a link with an expiration and **1–100 maximum ciphertext downloads**, inspect existing links, and revoke them. The browser generates the decryption secret and places it in the URL **fragment** (`#...`), which is not sent as part of a normal HTTP request. A visitor with the full URL can decrypt locally without an account.
+
+These are **bearer links**: anyone possessing the complete link may use it until it expires, is revoked, or reaches its limit. A failed client-side decrypt can still consume a counted ciphertext download. Revocation cannot undo prior downloads.
+
+## Security Center, authentication, and auditing
+
+- **Sessions:** View current/other logins with readable browser/OS labels, IP information and expiry. Revoke individual sessions or all other sessions.
+- **Password step-up:** Confirm the account password for a **five-minute** authorization window before higher-impact account actions. This does not log out the user after five minutes.
+- **Trusted browsers:** Mark or remove browsers; this is a recognition feature and **does not bypass authentication**.
+- **Passkeys:** Register, list and remove WebAuthn credentials; password login remains the fallback.
+- **Notifications:** In-app login/device/security alerts with a read/unread state.
+- **Activity timeline:** Inspect recorded login, file, sharing, session and link operations.
+- **Audit verification:** Events form an **HMAC-SHA-256-linked audit chain**. Verification detects certain database-only changes if the signing key is kept separately secret.
+- **Login throttling:** Login attempt counters persist in SQLite across standalone server restarts.
+- **CSRF/origin checks:** Session-bound CSRF tokens and same-origin validation protect state-changing authenticated API operations.
+- **Cookies:** Auth cookies are `HttpOnly` and `SameSite=Strict`. Production configuration requires `Secure` cookies over HTTPS; local HTTP standalone mode does not set `Secure`.
+
+### Audit signing key — important
+
+`data/audit_hmac.key` is a **secret**, generated locally, and must never be committed to Git or included in shared source archives. Preserve and back it up securely *alongside* the associated database. Deleting or replacing it can make existing audit records impossible to verify.
+
+The current audit append mechanism uses a process-local lock and is intended for a **single backend process**. The chain does not provide independent proof against full host compromise, signing-key theft or undetected log truncation; multiple-worker concurrency remains a limitation.
+
+## Architecture
+
+```text
+Browser (React + TypeScript + Web Crypto API)
+  ├─ Registration, login, passkey ceremonies, vault UI
+  ├─ Encrypt/decrypt contents and filenames locally
+  └─ Wrap/unwrap vault, file and sharing keys
+                 │ localhost HTTP (standalone)
+                 ▼
+FastAPI (Python, SQLAlchemy, Pydantic)
+  ├─ Authentication, session management, CSRF, throttling
+  ├─ Ownership, permission, sharing and download-limit enforcement
+  ├─ WebAuthn verification, security notifications, audit chain
+  ├─ SQLite: users, sessions, keys-as-ciphertext, grants, audit events
+  └─ Local filesystem: data/encrypted/ ciphertext blobs
 ```
 
-On first run, CipherDrop creates a Python virtual environment and installs backend/frontend dependencies. Choose **Standalone** for the easiest local run, then open `http://localhost:5173`.
+**Stack:** React, TypeScript, Vite, Web Crypto API; Python 3.11+, FastAPI, SQLAlchemy, Pydantic, Argon2, `webauthn`; SQLite; optional Caddy reverse proxy.
 
-## Key model
-The **account password** authenticates the account. The **vault passphrase** unlocks client-side encryption material. They serve different purposes and should be treated as separate secrets.
+**Where data lives:** SQLite and encrypted blobs are stored locally under `data/`, with configuration in `.env`. Each fresh standalone installation starts with its own local data. Never commit `.env`, `data/cipherdrop.db`, `data/audit_hmac.key`, local credentials or encrypted user files.
 
-For sharing, the server may store public keys, encrypted private-key blobs, wrapped DEKs, encrypted filenames, permissions, expiration times, and relationship metadata such as owner/recipient IDs. It should not receive the raw file DEK, plaintext sharing private key, plaintext filename, or plaintext file as part of the normal encryption/sharing flow.
+## Testing and vulnerability checks (optional, for development)
 
-## v0.7 developer test checklist (manual)
-1. Open CipherDrop in two independent browser profiles and sign in to the same account. Security page should show both sessions; revoke one and confirm it receives HTTP 401 on the next authenticated request.
-2. Click **Revoke all other sessions** and confirm only the current session survives.
-3. Upload, share, and revoke a test file. Confirm Activity lists events and Security verifies the chain. For tamper tests, use a **backup copy** of the database, not your real data.
-4. Generate a one-download link. Open it in a private window; decrypt and download. A second download should fail.
-5. Generate a longer-lived link and revoke it before downloading. Confirm it becomes unavailable.
-6. Test expiration with a short expiry and verify download is rejected after expiry.
-7. Run `python -m compileall backend/app` and `cd frontend && npm run build` on the Mac. Do not commit if the frontend build fails.
+```bash
+make test    # Python regression tests using isolated temporary data
+make audit   # Python pip-audit + npm audit (network access required)
+```
 
-**Academic integrity:** Threat model, security analysis, and AI reflection must be written by the students, not copied from generated documentation.
+The automated suite covers AES-GCM primitive tampering; account/file isolation; CSRF/origin enforcement; persistent rate limiting; shared-file expiry, permission and revocation paths; encrypted file storage/download; one-time link behavior; audit tampering; production configuration/cookie settings; and passkey challenge/access-control checks. **It does not replace manual end-to-end testing with a real authenticator or browser Web Crypto.**
 
-## Security Center update (v0.8–v0.9 / v1.0 hardening preview)
+Recommended manual regression: create an account → unlock vault → upload/download → test altered ciphertext → share with another account → revoke access → verify audit chain → register/login with a passkey → try drag-and-drop → inspect cookies under HTTPS.
 
-This development update adds a Security Center overview, five-minute password step-up for high-impact account actions, trusted-browser management, in-app security alerts, session-bound CSRF tokens, basic single-process login throttling, and production cookie/API-documentation guardrails. **Passkeys/WebAuthn are not yet implemented.** See `SECURITY_UPDATE.md` for setup, tests, and deployment limitations.
+`make audit` checks currently known advisories, not application logic, and should not be treated as proof of complete security. The frontend currently pins **Vite 8.3.6**; review new advisories before future deployments.
 
-### Final feature batch — passkeys, multi-file drop, readable devices
-- Account passkeys use WebAuthn with verified server-generated challenges and public-key signatures. Existing password login remains available. **Passkeys only authenticate the account; the separate vault passphrase must still be entered after login** so existing encryption and key wrapping remain unchanged.
-- Passkeys can be added under Security after using **Confirm password** (5-minute step-up), listed, and removed with a fresh step-up authorization. Use `http://localhost:5173` for local passkeys (not 127.0.0.1) or your configured production HTTPS origin.
-- Vault upload now supports dragging multiple files directly into the upload area and selecting multiple files using the file picker. The status shows encryption/upload stages and file counts (not network byte percentages). Each file must be at most 100 MB.
-- Sessions and trusted devices display readable browser and OS labels instead of entire user-agent strings.
-- `make` performs setup/build, `make run` automatically ensures setup on a fresh clone, and `make clean` removes generated build artifacts without erasing user data. Developer commands `make test` and `make audit` remain available during final validation.
-- The new passkey code depends on `webauthn>=2.5,<3`, which the initial `make` installs. Browser registration/login must be manually tested on a real secure-context browser before declaring WebAuthn fully verified.
+## HTTPS and deployment
+
+**Normal usage is localhost-only, with no hosting/menu option.** A previously added **optional** production configuration lives in `deploy/` with instructions in [PHASE1_SECURITY.md](PHASE1_SECURITY.md). It uses Caddy to serve the built frontend and proxy `/api/*` to a local FastAPI process over a TLS-protected public origin. Local testing can use `deploy/Caddyfile.local` and Caddy's locally trusted CA.
+
+Standalone `make run` **does not start Caddy** and is not an HTTPS production deployment. A public deployment would still require DNS, a valid TLS configuration, secure cookie verification, proper process management and an independent security review. Do **not** expose the Vite dev server or API port directly to the internet.
+
+## Known limitations
+
+- This is a teaching/research implementation and has **not received an independent production security audit**.
+- Local SQLite authentication throttling and the HMAC audit append implementation target one backend process; neither is designed for distributed hosting.
+- Browser-served cryptographic JavaScript remains a trust boundary. Vault passphrase derivation currently uses PBKDF2 rather than a memory-hard browser-side KDF.
+- Passkeys authenticate the account but don't replace vault unlocking; WebAuthn support varies by device/browser/origin.
+- Upload progress is **stage-based**, not exact percentage of network bytes.
+- Secure links and authorized recipient downloads cannot revoke plaintext that someone has already saved.
+- `make run` serves a development frontend on localhost. Production HTTPS is an **optional, separately configured deployment**.
+
+## Course project note
+
+CipherDrop demonstrates encryption, account security, access controls, network security configuration, and audit logging. The course's threat model, security evaluation, and AI-use reflection are separate **student-authored** submissions and are not provided by this README.
