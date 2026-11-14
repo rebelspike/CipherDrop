@@ -165,7 +165,3 @@ Standalone `make run` **does not start Caddy** and is not an HTTPS production de
 - Upload progress is **stage-based**, not exact percentage of network bytes.
 - Secure links and authorized recipient downloads cannot revoke plaintext that someone has already saved.
 - `make run` serves a development frontend on localhost. Production HTTPS is an **optional, separately configured deployment**.
-
-## Course project note
-
-CipherDrop demonstrates encryption, account security, access controls, network security configuration, and audit logging. The course's threat model, security evaluation, and AI-use reflection are separate **student-authored** submissions and are not provided by this README.
