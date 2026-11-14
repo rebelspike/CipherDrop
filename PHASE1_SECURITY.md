@@ -50,4 +50,3 @@ The tests use a separate temporary directory (`CIPHERDROP_DATA_DIR`) and do not 
 - Keep the backend private behind Caddy; never run an insecure API on an untrusted network.
 - Security testing is not a guarantee that the application is vulnerability-free.
 
-Do not ask AI to draft your course's threat model, security evaluation or reflection if prohibited by the rubric.
