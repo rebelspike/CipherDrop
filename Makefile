@@ -2,7 +2,7 @@
 .DEFAULT_GOAL := all
 SHELL := /bin/sh
 ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-PYTHON ?= python3
+PYTHON ?= $(shell brew --prefix python@3.13 2>/dev/null)/bin/python3.13
 PY := $(ROOT).venv/bin/python
 .PHONY: all setup run test audit clean clean-all help check-tools frontend-lock
 
