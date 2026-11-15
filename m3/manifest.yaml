@@ -1,0 +1,56 @@
+# ============================================================
+# Milestone 3 Manifest — CSCI 4531/6531 Project
+# Rename this ZIP to: lastname1-lastname2-lastname3.m3.zip before submitting
+# ============================================================
+
+milestone: 3
+
+team:
+  - name: "First Last"
+    gwid: "G12345678"
+    email: "name@gwu.edu"
+    role: architect
+  - name: "First Last"
+    gwid: "G12345679"
+    email: "name@gwu.edu"
+    role: engineer
+  # - name: "First Last"
+  #   gwid: "G12345680"
+  #   email: "name@gwu.edu"
+  #   role: auditor
+
+application:
+  name: "Your Application Name"
+  security_properties_implemented:
+    - encryption          # list only what is actually complete and demonstrated
+    - accounts
+    - audit_log
+
+submission:
+  report_page_count: 0           # fill in actual page count
+  slides_page_count: 0
+  presentation_video_url: "https://youtube.com/..."
+
+security_audit:
+  vulnerabilities_found: 0       # total AI red-team findings
+  vulnerabilities_fixed: 0       # how many were fixed before submission
+  residual_risks: 0              # how many remain as known limitations
+  red_team_scenarios_run: 0
+
+ai_usage:
+  tools_used:
+    - claude
+    # - cursor
+    # - gemini
+  used_for_red_team: false       # did you use AI for the security audit?
+
+checklist:
+  report_with_screenshots: false
+  security_audit_in_report: false
+  ux_review_in_report: false
+  agentic_reflection_in_report: false
+  slides_submitted: false
+  presentation_video_submitted: false
+  audit_instructions_in_src: false
+  dependency_scan_included: false
+  ai_usage_transcripts: false
