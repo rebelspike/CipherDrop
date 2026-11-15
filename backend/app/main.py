@@ -229,22 +229,31 @@ def check_login_limit(request: Request, username: str):
             conn.execute(AuthAttempt.__table__.insert(), [{"key": key, "created_at": now} for key, _ in keys])
 
 def clear_login_limit(request: Request, username: str):
-    # A valid password clears account-specific failures; retain the IP-wide
-    # budget to make account-spraying more expensive.
+    # A valid password clears account-specific failures and refunds the IP slot this
+    # attempt reserved, so the IP budget counts failures only. Otherwise ordinary logins
+    # from a shared address (an office NAT, or 127.0.0.1 locally) exhaust it for everyone.
     key = _attempt_key("account", username.strip().lower())
+    ip = request.client.host if request.client else "unknown"
+    ip_key = _attempt_key("ip", ip)
     with _login_lock:
         with engine.begin() as conn:
             conn.execute(AuthAttempt.__table__.delete().where(AuthAttempt.key == key))
+            latest = conn.execute(select(AuthAttempt.id).where(AuthAttempt.key == ip_key)
+                                  .order_by(AuthAttempt.id.desc()).limit(1)).scalar()
+            if latest is not None:
+                conn.execute(AuthAttempt.__table__.delete().where(AuthAttempt.id == latest))
 
 @app.post("/api/auth/login")
 def login(body: LoginRequest, response: Response, request: Request, db: DBSession = Depends(get_db)):
     check_login_limit(request, body.username)
     user = db.scalar(select(User).where(User.username == body.username.strip().lower()))
-    if not user:
-        raise HTTPException(401, "Invalid username or password")
     try:
+        if not user:
+            raise VerifyMismatchError
         ph.verify(user.password_hash, body.password)
     except (VerifyMismatchError, ValueError):
+        # The attempted username is not stored: users sometimes type a password into that field.
+        audit(db, user.id if user else None, "LOGIN_FAILED", result="failure"); db.commit()
         raise HTTPException(401, "Invalid username or password")
     clear_login_limit(request, body.username)
     if ph.check_needs_rehash(user.password_hash):
@@ -383,6 +392,7 @@ def download_blob(file_id: int, user: User = Depends(current_user), db: DBSessio
     path = STORAGE / row.object_name
     if not path.exists():
         raise HTTPException(410, "Encrypted object is missing")
+    audit(db, user.id, "FILE_DOWNLOADED", str(row.id)); db.commit()
     return FileResponse(path, media_type="application/octet-stream", filename=f"{file_id}.enc")
 
 
@@ -568,6 +578,7 @@ def download_shared_blob(share_id: int, user: User = Depends(current_user), db: 
     path = STORAGE / file_row.object_name
     if not path.exists():
         raise HTTPException(410, "Encrypted object is missing")
+    audit(db, user.id, "SHARE_DOWNLOADED", str(share.id)); db.commit()
     return FileResponse(path, media_type="application/octet-stream", filename=f"shared-{share_id}.enc")
 
 # v0.5 — authenticated session management
@@ -583,6 +594,10 @@ def revoke_session(session_id: int, request: Request, user: User = Depends(curre
     row = db.scalar(select(Session).where(Session.id == session_id, Session.user_id == user.id))
     if not row:
         raise HTTPException(404, 'Session not found')
+    # Revoking another session needs the same step-up as revoke-others; otherwise a stolen
+    # session could sign the owner out everywhere one session at a time.
+    if session_id != request.state.session_id:
+        require_step_up(request)
     audit(db, user.id, 'SESSION_REVOKED', str(row.id))
     notify(db, user.id, "A session was revoked")
     db.delete(row)
@@ -608,7 +623,10 @@ def security_activity(user: User = Depends(current_user), db: DBSession = Depend
 
 @app.get('/api/security/audit/verify')
 def audit_integrity(user: User = Depends(current_user), db: DBSession = Depends(get_db)):
-    return verify_audit(db)
+    # The chain covers every user's events, so don't reveal the system-wide count.
+    result = verify_audit(db)
+    result.pop("checked", None)
+    return result
 
 # v0.7 — encrypted links. Secret is only in browser URL fragment, never server request.
 from pydantic import BaseModel, Field
@@ -707,6 +725,7 @@ def step_up(body: PasswordConfirmation, request: Request, user: User = Depends(c
         if not ph.verify(user.password_hash, body.password):
             raise HTTPException(401, "Invalid password")
     except (VerifyMismatchError, ValueError):
+        audit(db, user.id, "STEP_UP_FAILED", result="failure"); db.commit()
         raise HTTPException(401, "Invalid password")
     clear_login_limit(request, user.username + ":stepup")
     request.state.session_row.step_up_until = datetime.now(timezone.utc) + timedelta(minutes=5)
