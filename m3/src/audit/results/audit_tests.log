@@ -1,0 +1,57 @@
+Registering test users (PBKDF2 600k each)...
+
+[A-2] Password storage -> DEFENDED
+  observed: 4 users; all $argon2id$: True; unique salts: True; plaintext password/passphrase found in raw DB bytes for: none
+    alice_59d2: $argon2id$v=19$m=65536,t=3,p=4$3BAHJuSdi...
+    bob_59d2: $argon2id$v=19$m=65536,t=3,p=4$O1kNDJGVx...
+    param string: m=65536,t=3,p=4
+
+[S-1] Stolen token hash replayed as cookie -> DEFENDED
+  observed: real cookie -> 200; DB token_hash used as cookie -> 401; sha256(cookie)==stored hash: True; raw token in DB: False
+    GET /api/auth/me with stolen hash -> HTTP 401
+
+[C-1] Tampered ciphertext (1 byte flipped in .enc file) -> DEFENDED
+  observed: untampered -> ok; 1-byte flip in .enc -> integrity_error; 1-bit flip in wrapped DEK (DB) -> integrity_error
+    file 1 object a72ea2e899474652a039bad34eca3c65.enc, flipped byte offset 5
+    decrypt raised cryptography.exceptions.InvalidTag
+
+[C-2] Swapped files (malicious server / DB write access) -> VULNERABLE
+  observed: Variant 1 (swap ciphertext only) -> integrity_error. Variant 2 (swap ciphertext + IV + wrapped DEK) -> decrypted with NO error: file shown as 'Q3-salary-report.txt' but contents are b'Contents of file B: vacation notes'
+    ciphertext-only swap fails because each file has its own DEK
+    full-tuple swap succeeds because AES-GCM is used with no AAD binding ciphertext/DEK to file ID or filename
+
+[R-1] IDOR: accessing another user's files by ID -> DEFENDED
+  observed: 322 requests from mallory across file IDs 1-40, share IDs 1-40 and alice's session IDs. Distinct status codes per endpoint: {'GET blob': [404], 'PUT replace': [404], 'DELETE': [404], 'GET shares': [404], 'GET links': [404], 'POST link': [404], 'GET shared blob': [404], 'DELETE share': [404], 'DELETE alice session': [404]}. Alice's files/shares unchanged: True
+    non-404 responses: none
+    alice .enc SHA-256 before == after: True
+
+[R-2] Reshare privilege escalation -> DEFENDED
+  observed: (a) reshare without Reshare permission -> HTTP 404. (b) bob (no Download) reshared asking for Download+Reshare+no-expiry -> HTTP 201; carol's grant: can_download=False, can_reshare=True, expiry capped to parent's: True; carol blob download -> 404; bob direct blob download (view-only bypass) -> 404. (c) after alice revoked bob: carol download -> 404, carol still lists file: False
+    requested can_download=true was downgraded to false
+    requested expires_at=null was capped to parent expiry
+
+[L-1] Download-limit race (50 simultaneous downloads, limit 1) -> DEFENDED
+  observed: responses: {200: 1, 404: 49}; download_count in DB: 1
+    50 threads released together with a threading.Barrier
+
+[L-2] Reusing a dead link (revoked / expired / exhausted) -> DEFENDED
+  observed: live link before revoke -> (200, 200); before-expiry metadata -> 200; first download of 1-use link -> 200; after: revoked -> (metadata 404, download 404); expired -> (metadata 404, download 404); exhausted -> (metadata 404, download 404); file deleted -> (metadata 404, download 404)
+
+[G-2] Missing events (failed login + downloads) -> DEFENDED
+  observed: failed login -> HTTP 401; owner download -> HTTP 200; shared download -> HTTP 200. Audit rows before/after: 34/37; new events: ['SHARE_DOWNLOADED', 'FILE_DOWNLOADED', 'LOGIN_FAILED']; alice Activity view unchanged: False
+    
+
+[G-1] Editing or deleting an audit entry -> DEFENDED
+  observed: baseline -> {'valid': True}; edited event 19 -> {'valid': False, 'failed_event_id': 19}; deleted event 19 -> {'valid': False, 'failed_event_id': 20}; [extra] deleted last 10 rows -> {'valid': True}; [extra] rewrote entry 19 and recomputed HMACs with the key file -> {'valid': True}; restored -> {'valid': True}
+    tail truncation detected: False
+    forgery with key detected: False
+
+[X-1] [Extra] Expiration date without a timezone -> OK
+  observed: share with expires_at '2030-01-01T00:00:00' -> HTTP 422; link with same -> HTTP 422
+
+[A-1] Brute-force login (1,000 rapid attempts) -> DEFENDED
+  observed: 1000 attempts in 1.1s (921.8/s, 10 threads). Status codes: {429: 993, 401: 7}. Correct password on attempt #1000 returned 429. Different user (bob) logging in during alice's lockout -> 200.
+    status code histogram: {429: 993, 401: 7}
+    attempt #1000 (correct password) -> HTTP 429
+
+Saved 12 results to /Users/mainfolder/Documents/CSecurity/Project/CipherDrop/m3/src/audit/results/audit_results.json
