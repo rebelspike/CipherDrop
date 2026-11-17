@@ -31,6 +31,47 @@ The standalone launcher runs a Vite development frontend on `localhost:5173` and
 
 For more installation/troubleshooting detail, see [SETUP.md](SETUP.md).
 
+## Quick start (Windows — Command Prompt)
+
+**Prerequisites:** Windows 10/11, **Python 3.11+** (Python 3.13 is a supported example), **Node.js 20.19+** with npm, and a modern browser. Internet access is needed the first time to install dependencies. **These steps use Command Prompt (`cmd.exe`), not PowerShell.** Windows is supported by the underlying Python/React application, but this final workflow has **not been independently verified on a clean Windows PC**.
+
+Open **Command Prompt** in the extracted `CipherDrop` project folder (the folder containing `backend`, `frontend`, and `README.md`). You can enter it using `cd /d "C:\path\to\CipherDrop"` or by opening a terminal from File Explorer. The following commands are **relative to that project folder**; there is no need to copy another student's user-specific path.
+
+**First-time setup** (run once):
+
+```cmd
+py -3.13 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r backend\requirements.txt
+cd frontend
+npm ci
+cd ..
+```
+
+If Python 3.13 is not installed, change `py -3.13` to the version you have installed (for example `py -3.11`), but **do not use Python 3.9**. Check with `py --list` and `.venv\Scripts\python.exe --version`. This is especially important after recreating `.venv`.
+
+**Start the application:** Open **two Command Prompt windows** in the project folder and keep both open.
+
+**Window 1 — API/backend:**
+
+```cmd
+.venv\Scripts\python.exe -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000
+```
+
+**Window 2 — React frontend:**
+
+```cmd
+cd frontend
+npm run dev
+```
+
+Open **http://localhost:5173** in a browser. Press **Ctrl+C** in each window to stop. On future runs, repeat **only the two startup commands**; do not repeat `npm ci` or the Python dependency install unless dependencies change. Use `localhost`, not `127.0.0.1`, for CipherDrop's configured local passkey origin.
+
+**Windows notes:** `make` is the macOS/Linux convenience command; Windows does **not** require Make for the above instructions. The existing `start.ps1` has not been validated as a replacement for these two Command Prompt windows. Do not expose the localhost development server to the public internet.
+
+### Standalone data is per installation
+
+Every standalone installation has its **own SQLite database, encrypted files, and audit signing key**. Accounts and files created on one computer do **not** automatically appear on teammates' computers. Multiple users can register and share files **within the same running instance**, subject to permissions. Do not commit or transfer local `.env` files, databases, encrypted blobs, or signing keys as part of the source release.
+
 ## Features at a glance
 
 | Area | Implemented functionality |

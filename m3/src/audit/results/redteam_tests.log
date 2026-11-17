@@ -1,0 +1,32 @@
+
+[RT-1] Global login lockout through a shared IP -> DEFENDED
+  50 successful logins from one IP -> [200]. Attacker at 10.0.0.66, 45 failed logins for fake users: 40x401 then 5x429. Victim on localhost -> 200; victim on another LAN IP -> 200.
+
+[RT-2] X-Forwarded-For spoofing -> DEFENDED
+  LAN client 10.0.0.88 sending a fake 'X-Forwarded-For: 203.0.113.50' -> session IP recorded as '10.0.0.88'. Spray of 100 accounts from one LAN IP, new fake IP each: 40x401, 60x429. [Known limit] A client on the server machine itself can still spoof: session shows '203.0.113.51'.
+
+[RT-3] Step-up bypass by revoking sessions one at a time -> DEFENDED
+  Without step-up: revoke all others -> 403, revoke one other session -> 403. After step-up (200) -> 204.
+
+[RT-4] Username enumeration (accepted risk) -> VULNERABLE
+  Median failed login: real users 24.0 ms vs non-existent 4.2 ms (21 samples each). Register with a taken username -> 409 'Username is unavailable'.
+
+[RT-5] Failed step-up attempts audited -> DEFENDED
+  Wrong step-up password -> 401; STEP_UP_FAILED rows 0 -> 1; shown in the user's Activity log: True.
+
+[RT-6] Audit verify reveals system-wide event count -> DEFENDED
+  New user calls /api/security/audit/verify -> {'valid': True} (system holds 235 events).
+
+[RT-7] CSRF on state-changing requests -> DEFENDED
+  DELETE without X-CSRF-Token -> 403; Origin: evil.example -> 403; Sec-Fetch-Site: cross-site -> 403; file survived: True; legitimate DELETE -> 204.
+
+[RT-8] Session fixation -> DEFENDED
+  Login with a planted cookie issued a new random token: True; planted value -> 401. Logging in again while holding a valid session -> old token -> 401.
+
+[RT-9] Account password equal to vault passphrase -> MANUAL
+  The server never sees the vault passphrase, so this check lives in the register form and can't be tested over the API. Open http://localhost:5173, choose Create account, and enter the same value for 'Account password' and 'Vault passphrase'. Expected: the form refuses with 'Your vault passphrase must be different from your account password...'
+
+[RT-10] Oversized upload metadata (DoS) -> DEFENDED
+  Upload with a 5 MiB encrypted_filename -> 400 '{"detail":"Part exceeded maximum size of 1024KB."}'
+
+Saved 10 results to /Users/mainfolder/Documents/CSecurity/Project/CipherDrop/m3/src/audit/results/redteam_results.json

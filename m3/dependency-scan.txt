@@ -1,0 +1,24 @@
+CipherDrop dependency vulnerability scan
+Date: 2026-11-15 15:17 EST
+Tools: pip-audit 2.10.1, npm 11.20.0, Python 3.13.18, Node v26.13.0
+
+========================================================================
+1) Python: declared dependencies
+$ pip-audit -r backend/requirements.txt
+========================================================================
+No known vulnerabilities found
+(exit code 0)
+
+========================================================================
+2) Python: packages actually installed in .venv (includes test and audit tooling)
+$ pip-audit
+========================================================================
+No known vulnerabilities found
+(exit code 0)
+
+========================================================================
+3) Node.js: frontend dependencies (all severities)
+$ cd frontend && npm audit
+========================================================================
+found 0 vulnerabilities
+(exit code 0)

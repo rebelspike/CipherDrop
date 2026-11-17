@@ -2,20 +2,30 @@
 .DEFAULT_GOAL := all
 SHELL := /bin/sh
 ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-PYTHON ?= python3
 PY := $(ROOT).venv/bin/python
 .PHONY: all setup run test audit clean clean-all help check-tools frontend-lock
 
 all: setup
 
 check-tools:
-	@command -v $(PYTHON) >/dev/null || { echo 'ERROR: Install Python 3.11+ first.' >&2; exit 1; }
+	@set -e; \
+	if [ -x "$(PY)" ]; then \
+	  "$(PY)" -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)' || { echo 'ERROR: Existing .venv uses Python older than 3.11. Run make clean-all, then make.' >&2; exit 1; }; \
+	else \
+	  candidate=$$(sh "$(ROOT)scripts/select_python.sh"); \
+	  if [ -z "$$candidate" ]; then echo 'ERROR: Python 3.11+ not found. Install Python 3.11+ and retry.' >&2; exit 1; fi; \
+	  "$$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)' || exit 1; \
+	fi
 	@command -v node >/dev/null || { echo 'ERROR: Install Node.js 20.19+ (with npm) first.' >&2; exit 1; }
 	@command -v npm >/dev/null || { echo 'ERROR: npm not found; install Node.js.' >&2; exit 1; }
 	@node -e 'const n=process.versions.node.split(".").map(Number); if(n[0]<20 || (n[0]===20 && n[1]<19)) { console.error("ERROR: Node.js 20.19+ required; found "+process.version); process.exit(1) }'
 
 $(PY):
-	$(PYTHON) -m venv "$(ROOT).venv"
+	@set -e; candidate=$$(sh "$(ROOT)scripts/select_python.sh"); \
+	  if [ -z "$$candidate" ]; then echo 'ERROR: Python 3.11+ not found.' >&2; exit 1; fi; \
+	  echo "[→] Creating virtual environment with $$candidate"; \
+	  "$$candidate" -m venv "$(ROOT).venv"; \
+	  "$(PY)" -c 'import sys; assert sys.version_info >= (3,11)' 
 
 # The lockfile from older builds can still point at vulnerable Vite 8.3.1.
 # Refresh it ONLY if it does not lock the patched version required by package.json.
