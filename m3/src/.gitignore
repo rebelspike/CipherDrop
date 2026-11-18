@@ -1,0 +1,21 @@
+.env
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+data/cipherdrop.db
+data/encrypted/*
+!data/encrypted/.gitkeep
+certs/*.key
+certs/*.pem
+.DS_Store
+logins.md
+
+# CipherDrop update backups
+.cipherdrop-update-backups/
+
+# Audit HMAC signing key — NEVER COMMIT
+data/audit_hmac.key
+
+# Generated frontend build
+frontend/dist/

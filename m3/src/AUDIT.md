@@ -1,7 +1,7 @@
 # Security Audit Instructions
 ## CipherDrop
 
-This document lets someone unfamiliar with the project reproduce our security audit independently. Every test is automated in `m3/src/audit/`, and one command runs all of them against a **throwaway copy** of CipherDrop's data. Your own accounts and files are never touched.
+This document lets someone unfamiliar with the project reproduce our security audit independently. Every test is automated in `src/audit/`, and one command runs all of them against a **throwaway copy** of CipherDrop's data. Your own accounts and files are never touched.
 
 ---
 
@@ -13,7 +13,7 @@ This document lets someone unfamiliar with the project reproduce our security au
 * Internet access on the first run. The audit installs `backend/requirements-test.txt` (`httpx`, `cryptography`) into `.venv`.
 * **No test accounts need to be created.** The scripts register their own users (alice, bob, carol, mallory, and so on, with a random suffix).
 
-**Audit files** (in `m3/src/audit/`):
+**Audit files** (in `src/audit/`):
 
 | File | What it does |
 |---|---|
@@ -32,7 +32,7 @@ From the project root:
 
 ```bash
 make                         # first time only
-./m3/src/audit/run_audit.sh
+./src/audit/run_audit.sh
 ```
 
 It takes about 2 minutes and ends with a summary.
@@ -76,8 +76,8 @@ To run a script on its own, start the servers yourself with a temporary data fol
 export CIPHERDROP_DATA_DIR="$(mktemp -d)"                       # throwaway data
 .venv/bin/python -m uvicorn app.main:app --app-dir backend --port 8000 &
 (cd frontend && node_modules/.bin/vite --host 127.0.0.1 --port 5173) &
-.venv/bin/python m3/src/audit/audit_tests.py   http://127.0.0.1:8000 "$CIPHERDROP_DATA_DIR"
-.venv/bin/python m3/src/audit/redteam_tests.py http://127.0.0.1:5173 http://127.0.0.1:8000 "$CIPHERDROP_DATA_DIR"
+.venv/bin/python src/audit/audit_tests.py   http://127.0.0.1:8000 "$CIPHERDROP_DATA_DIR"
+.venv/bin/python src/audit/redteam_tests.py http://127.0.0.1:5173 http://127.0.0.1:8000 "$CIPHERDROP_DATA_DIR"
 ```
 
 Never point the scripts at your real `data/` folder: the tamper tests modify the database.

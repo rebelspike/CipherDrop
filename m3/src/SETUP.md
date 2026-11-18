@@ -1,122 +1,60 @@
-# Setup Guide
-## [Your Application Name]
-
-This guide lets someone unfamiliar with the project get it running from scratch.
-
----
+# CipherDrop — Quick Start (macOS/Linux)
 
 ## Requirements
+- Python 3.11 or newer (`python3`)
+- Node.js **20.19+** with `npm`
+- `make` (available with macOS Command Line Tools or Linux build tools)
+- Internet connection **on first installation** to download dependencies
+- Modern browser with Web Crypto support
 
-| Requirement | Version | Notes |
-|---|---|---|
-| Python | 3.11+ | Or your language/runtime |
-| [Database] | [Version] | e.g., SQLite (built-in) or PostgreSQL 15 |
-| [Other dependency] | [Version] | |
+## Start from a clean submission ZIP
 
----
-
-## Installation
-
-### 1. Clone the repository
+Extract the project and open Terminal inside the folder containing `Makefile`.
 
 ```bash
-git clone https://github.com/yourteam/your-repo.git
-cd your-repo
+make
+make run
 ```
 
-### 2. Create a virtual environment (Python)
+CipherDrop starts directly in **Standalone** mode. Open `http://localhost:5173` in your browser. Press `Ctrl+C` to stop.
+
+`make` creates a local `.venv`, installs the backend and frontend dependencies, locks Vite to patched version **8.3.6** if the lockfile is older, and builds the frontend. No pre-existing accounts or database are needed. Running `make` again is safe.
+
+## Additional commands (optional)
 
 ```bash
-python -m venv venv
-source venv/bin/activate        # macOS / Linux
-# or: venv\Scripts\activate     # Windows
+make test     # install test dependencies and run security regression tests
+make audit    # check Python/npm dependencies against known advisories
+make clean    # clear generated build artifacts; KEEP user data and packages
+make help
 ```
 
-### 3. Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### 4. Configure environment variables
-
-Copy the example environment file and fill in required values:
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env`:
-
-```
-SECRET_KEY=your-random-secret-key-here   # generate with: python -c "import secrets; print(secrets.token_hex(32))"
-DATABASE_URL=sqlite:///app.db            # or your database connection string
-# Add any other required variables
-```
-
-**Important:** Never commit `.env` to git. The `.gitignore` should already exclude it.
-
-### 5. Initialize the database
-
-```bash
-python init_db.py
-# or: flask db upgrade (if using Flask-Migrate)
-```
-
----
-
-## Running the Application
-
-```bash
-python app.py
-```
-
-Open your browser to: `http://localhost:5000`
-
-### Default accounts (development only)
-
-| Username | Password | Role |
-|---|---|---|
-| admin@example.com | [see .env.example] | Admin |
-| viewer@example.com | [see .env.example] | Viewer |
-
-**These accounts exist only in development. Production setup requires creating accounts manually.**
-
----
-
-## Running with Docker (optional)
-
-```bash
-docker build -t myapp .
-docker run -p 5000:5000 --env-file .env myapp
-```
-
----
+`make audit` needs internet access and can return a nonzero exit status if a vulnerability is found. A passing audit is **not** proof that the application has no vulnerabilities.
 
 ## Troubleshooting
+- **`make: command not found`** on macOS: install Apple's Command Line Tools (`xcode-select --install`).
+- **Node.js version error:** install Node.js 20.19+ (or a recent supported LTS).
+- **Network/npm error:** verify internet access and rerun `make`.
+- **Ports 5173/8000 in use:** stop the other app process and rerun `make run`.
+- **Python dependency install fails:** verify Python 3.11+ and internet access.
+- **Application data persists after `make clean`:** intentional. Cleanup never deletes encrypted blobs, the SQLite database, `.env`, or the audit HMAC key.
 
-**Error: `ModuleNotFoundError: No module named 'cryptography'`**
-→ Make sure your virtual environment is activated and you ran `pip install -r requirements.txt`.
+## Important security notes
+Standalone mode binds to localhost. Do **not** expose the Vite development server or the Standalone HTTP endpoints directly to the internet. Remote deployment requires a proper HTTPS reverse proxy and production security configuration; see `PHASE1_SECURITY.md`.
 
-**Error: `DATABASE_URL not set`**
-→ Make sure you copied `.env.example` to `.env` and filled in the values.
+Windows uses `start.ps1` (GNU Make instructions above target macOS/Linux).
 
-**[Add other common errors and fixes here]**
+## Simple grading setup (macOS/Linux)
 
----
-
-## CLI Tools (if applicable)
-
-If your application includes CLI components, document them here:
+Prerequisites: Python 3.11+, Node.js 20.19+, npm, and GNU Make. Internet connection required on first run.
 
 ```bash
-python cli.py --help
-# Output:
-# Usage: cli.py [OPTIONS] COMMAND
-# ...
+make
+make run
 ```
 
-| Command | Description | Example |
-|---|---|---|
-| `cli.py encrypt <file>` | Encrypt a file | `python cli.py encrypt secret.txt` |
-| [command] | [description] | [example] |
+It starts directly in **Standalone** mode. Open `http://localhost:5173` (use **localhost**, not 127.0.0.1, for passkeys). `make run` also performs initial setup automatically if required. `make clean` removes only build artifacts and caches, **not accounts, encrypted files, or audit secrets**.
+
+To test a passkey: sign in with your password, unlock the vault, open Security, click Confirm password, then Add passkey. Log out, enter your username and choose Sign in with a passkey. After passkey authentication enter your separate vault passphrase.
+
+A Mac or PC must have platform passkey support (Touch ID/Windows Hello/security key or paired phone). Browser WebAuthn requires a trustworthy origin (localhost or HTTPS). Development over `http://127.0.0.1:5173` is not supported for passkey registration by this implementation; use `http://localhost:5173`.

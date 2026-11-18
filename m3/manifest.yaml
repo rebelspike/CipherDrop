@@ -1,56 +1,46 @@
-# ============================================================
-# Milestone 3 Manifest — CSCI 4531/6531 Project
-# Rename this ZIP to: lastname1-lastname2-lastname3.m3.zip before submitting
-# ============================================================
-
 milestone: 3
-
 team:
-  - name: "First Last"
-    gwid: "G12345678"
-    email: "name@gwu.edu"
+  - name: "Richard Webb"
+    gwid: "G31162428"
+    email: "r.webb1@gwu.edu"
     role: architect
-  - name: "First Last"
-    gwid: "G12345679"
-    email: "name@gwu.edu"
+  - name: "Kamran Ahmad"
+    gwid: "G37094725"
+    email: "k.ahmad@gwu.edu"
     role: engineer
-  # - name: "First Last"
-  #   gwid: "G12345680"
-  #   email: "name@gwu.edu"
-  #   role: auditor
-
+  - name: "Eric Torres"
+    gwid: "G3790557"
+    email: "eric.torres@gwmail.gwu.edu"
+    role: auditor
 application:
-  name: "Your Application Name"
+  name: "CipherDrop"
   security_properties_implemented:
-    - encryption          # list only what is actually complete and demonstrated
+    - encryption
     - accounts
+    - rbac
     - audit_log
-
+    - networking 
 submission:
-  report_page_count: 0           # fill in actual page count
-  slides_page_count: 0
-  presentation_video_url: "https://youtube.com/..."
-
+  report_page_count: 19
+  slides_page_count: 12
+  presentation_video_url: ""  https://drive.google.com/file/d/1sSSfSKqpaM85xPl6Ek4JPa1go-tAfNhQ/view?usp=sharing
 security_audit:
-  vulnerabilities_found: 0       # total AI red-team findings
-  vulnerabilities_fixed: 0       # how many were fixed before submission
-  residual_risks: 0              # how many remain as known limitations
-  red_team_scenarios_run: 0
-
+  vulnerabilities_found: 12  
+  vulnerabilities_fixed: 9  
+  residual_risks: 3    
+  red_team_scenarios_run: null 
 ai_usage:
   tools_used:
+    - chatgpt
     - claude
-    # - cursor
-    # - gemini
-  used_for_red_team: false       # did you use AI for the security audit?
-
+  used_for_red_team: true  
 checklist:
-  report_with_screenshots: false
-  security_audit_in_report: false
-  ux_review_in_report: false
-  agentic_reflection_in_report: false
-  slides_submitted: false
+  report_with_screenshots: true
+  security_audit_in_report: true
+  ux_review_in_report: true
+  agentic_reflection_in_report: true
+  slides_submitted: true
   presentation_video_submitted: false
-  audit_instructions_in_src: false
-  dependency_scan_included: false
-  ai_usage_transcripts: false
+  audit_instructions_in_src: true
+  dependency_scan_included: true
+  ai_usage_transcripts: true 

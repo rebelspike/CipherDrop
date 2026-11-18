@@ -1,0 +1,972 @@
+import hashlib
+import base64
+from urllib.parse import urlsplit
+import os
+import json
+import hmac
+import threading
+import secrets
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from sqlalchemy import select, text, update
+from sqlalchemy.orm import Session as DBSession
+
+from .database import Base, engine, get_db
+from .models import User, Session, FileRecord, UserCryptoProfile, FileShare, AuditEvent, SecureLink, TrustedDevice, SecurityNotification, AuthAttempt, PasskeyCredential, PasskeyChallenge
+from .schemas import RegisterRequest, LoginRequest, CryptoProfileRequest, ShareRequest, ReshareRequest
+
+ROOT = Path(__file__).resolve().parents[2]
+DATA_DIR = Path(os.getenv("CIPHERDROP_DATA_DIR", str(ROOT / "data"))).resolve()
+STORAGE = DATA_DIR / "encrypted"
+STORAGE.mkdir(parents=True, exist_ok=True)
+SESSION_COOKIE = "cipherdrop_session"
+SESSION_HOURS = 12
+COOKIE_SECURE = os.getenv("CIPHERDROP_COOKIE_SECURE", "false").lower() == "true"
+PUBLIC_ORIGIN = os.getenv("CIPHERDROP_PUBLIC_ORIGIN", "").rstrip("/")
+MAX_FILE_BYTES = 100 * 1024 * 1024
+ph = PasswordHasher()
+
+PRODUCTION = os.getenv("CIPHERDROP_ENV", "development").lower() == "production"
+if PRODUCTION and (not COOKIE_SECURE or not PUBLIC_ORIGIN.startswith("https://")):
+    raise RuntimeError("Production requires CIPHERDROP_COOKIE_SECURE=true and CIPHERDROP_PUBLIC_ORIGIN=https://your-domain")
+app = FastAPI(title="CipherDrop API", version="1.0.0", docs_url=None if PRODUCTION else "/docs", redoc_url=None if PRODUCTION else "/redoc", openapi_url=None if PRODUCTION else "/openapi.json")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=([PUBLIC_ORIGIN] if PRODUCTION else ["http://localhost:5173", "http://127.0.0.1:5173"]),
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["Content-Type", "X-CSRF-Token"],
+)
+
+@app.on_event("startup")
+def startup():
+    Base.metadata.create_all(bind=engine)
+    # Lightweight SQLite migration for pre-v0.4 development databases.
+    # SQLAlchemy create_all() creates new tables but does not add columns to existing ones.
+    if engine.dialect.name == "sqlite":
+        with engine.begin() as conn:
+            cols = {row[1] for row in conn.execute(text("PRAGMA table_info(file_shares)"))}
+            additions = {
+                "grantor_id": "INTEGER",
+                "parent_share_id": "INTEGER",
+                "can_view": "BOOLEAN NOT NULL DEFAULT 1",
+                "can_download": "BOOLEAN NOT NULL DEFAULT 1",
+                "can_reshare": "BOOLEAN NOT NULL DEFAULT 0",
+                "expires_at": "DATETIME",
+            }
+            for name, ddl in additions.items():
+                if name not in cols:
+                    conn.execute(text(f"ALTER TABLE file_shares ADD COLUMN {name} {ddl}"))
+            conn.execute(text("UPDATE file_shares SET grantor_id = owner_id WHERE grantor_id IS NULL"))
+            session_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(sessions)"))}
+            for name, ddl in {"user_agent":"VARCHAR(300) DEFAULT 'Unknown'", "ip_address":"VARCHAR(100) DEFAULT 'Unknown'", "last_seen_at":"DATETIME", "step_up_until":"DATETIME"}.items():
+                if name not in session_cols:
+                    conn.execute(text(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}"))
+            conn.execute(text("UPDATE sessions SET last_seen_at = created_at WHERE last_seen_at IS NULL"))
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+def current_user(request: Request, db: DBSession = Depends(get_db)) -> User:
+    token = request.cookies.get(SESSION_COOKIE)
+    if not token:
+        raise HTTPException(401, "Authentication required")
+    row = db.scalar(select(Session).where(Session.token_hash == hash_token(token)))
+    if not row or row.expires_at.replace(tzinfo=timezone.utc) <= datetime.now(timezone.utc):
+        if row:
+            db.delete(row)
+            db.commit()
+        raise HTTPException(401, "Session expired or invalid")
+    user = db.get(User, row.user_id)
+    if not user:
+        raise HTTPException(401, "Authentication required")
+    request.state.session_id = row.id
+    request.state.session_row = row
+    return user
+
+def create_session(response: Response, user: User, db: DBSession, request: Request):
+    existing = request.cookies.get(SESSION_COOKIE)
+    if existing:
+        previous = db.scalar(select(Session).where(Session.token_hash == hash_token(existing)))
+        if previous:
+            db.delete(previous)
+    raw = secrets.token_urlsafe(32)
+    expires = datetime.now(timezone.utc) + timedelta(hours=SESSION_HOURS)
+    db.add(Session(user_id=user.id, token_hash=hash_token(raw), expires_at=expires, user_agent=request.headers.get("user-agent", "Unknown")[:300], ip_address=request.client.host if request.client else "Unknown", last_seen_at=datetime.now(timezone.utc)))
+    db.commit()
+    response.set_cookie(
+        SESSION_COOKIE, raw, httponly=True, samesite="strict", secure=COOKIE_SECURE,
+        max_age=SESSION_HOURS * 3600, path="/"
+    )
+
+
+AUDIT_KEY_FILE = DATA_DIR / "audit_hmac.key"
+AUDIT_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+if not AUDIT_KEY_FILE.exists():
+    try:
+        with AUDIT_KEY_FILE.open("xb") as fh:
+            fh.write(secrets.token_bytes(32))
+        os.chmod(AUDIT_KEY_FILE, 0o600)
+    except FileExistsError:
+        pass
+AUDIT_KEY = AUDIT_KEY_FILE.read_bytes()
+CSRF_KEY = hmac.new(AUDIT_KEY, b"cipherdrop-csrf-v1", hashlib.sha256).digest()
+
+def csrf_value(session_token: str) -> str:
+    return hmac.new(CSRF_KEY, session_token.encode(), hashlib.sha256).hexdigest()
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    # Same-origin protection supplements the session-bound CSRF token.
+    # Production HTTPS terminates at Caddy; the application trusts only the
+    # configured public origin, not arbitrary Host/X-Forwarded-* headers.
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path.startswith("/api/"):
+        origin = request.headers.get("origin")
+        if origin:
+            from urllib.parse import urlsplit
+            parsed = urlsplit(origin)
+            valid = (origin == PUBLIC_ORIGIN if PRODUCTION else
+                     origin in {"http://localhost:5173", "http://127.0.0.1:5173", "http://testserver"})
+            if not valid or parsed.username or parsed.password:
+                return JSONResponse({"detail": "Cross-origin request denied"}, status_code=403)
+        elif request.headers.get("sec-fetch-site") == "cross-site":
+            return JSONResponse({"detail": "Cross-site request denied"}, status_code=403)
+        token = request.cookies.get(SESSION_COOKIE)
+        if token and request.url.path not in {"/api/auth/login", "/api/auth/register"} and not request.url.path.startswith("/api/public/links/"):
+            supplied = request.headers.get("x-csrf-token", "")
+            if not hmac.compare_digest(supplied, csrf_value(token)):
+                return JSONResponse({"detail": "CSRF token required"}, status_code=403)
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Cache-Control"] = "no-store" if request.url.path.startswith("/api/") else "no-cache"
+    if PRODUCTION:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000"
+    return response
+
+_audit_lock = threading.RLock()
+
+def audit(db: DBSession, user_id: int | None, event: str, resource: str = "", result: str = "success"):
+    # Call only for authoritative server-side events; commit atomically with business operation.
+    with _audit_lock:
+        last = db.scalar(select(AuditEvent).order_by(AuditEvent.id.desc()).limit(1))
+        prev = last.event_hash if last else "0" * 64
+        row = AuditEvent(user_id=user_id, event_type=event, resource_id=str(resource), result=result,
+                         previous_hash=prev, event_hash="", created_at=datetime.now(timezone.utc).replace(tzinfo=None))
+        db.add(row)
+        db.flush()
+        payload = json.dumps([row.id, row.user_id, row.event_type, row.resource_id, row.result,
+                              row.created_at.isoformat(), row.previous_hash], separators=(",", ":"))
+        row.event_hash = hmac.new(AUDIT_KEY, payload.encode(), hashlib.sha256).hexdigest()
+        db.flush()
+
+def verify_audit(db: DBSession):
+    prev = "0" * 64
+    events = db.scalars(select(AuditEvent).order_by(AuditEvent.id)).all()
+    for row in events:
+        payload = json.dumps([row.id, row.user_id, row.event_type, row.resource_id, row.result,
+                              row.created_at.isoformat(), row.previous_hash], separators=(",", ":"))
+        expected = hmac.new(AUDIT_KEY, payload.encode(), hashlib.sha256).hexdigest()
+        if row.previous_hash != prev or not hmac.compare_digest(expected, row.event_hash):
+            return {"valid": False, "checked": len(events), "failed_event_id": row.id}
+        prev = row.event_hash
+    return {"valid": True, "checked": len(events)}
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "version": "1.0.0"}
+
+@app.post("/api/auth/register", status_code=201)
+def register(body: RegisterRequest, response: Response, request: Request, db: DBSession = Depends(get_db)):
+    username = body.username.strip().lower()
+    check_login_limit(request, username + ":register")
+    if db.scalar(select(User).where(User.username == username)):
+        raise HTTPException(409, "Username is unavailable")
+    user = User(
+        username=username,
+        password_hash=ph.hash(body.password),
+        vault_salt=body.vault_salt,
+        vault_wrap_iv=body.vault_wrap_iv,
+        wrapped_vault_key=body.wrapped_vault_key,
+        kdf_iterations=body.kdf_iterations,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    clear_login_limit(request, username + ":register")
+    create_session(response, user, db, request)
+    audit(db, user.id, "SESSION_CREATED")
+    db.commit()
+    return {"id": user.id, "username": user.username}
+
+# SQLite-backed throttling survives server restarts. It is designed for a
+# single-instance deployment; a replicated deployment needs a shared limiter.
+_login_lock = threading.Lock()
+
+def _attempt_key(scope: str, value: str) -> str:
+    return hmac.new(AUDIT_KEY, f"{scope}:{value}".encode(), hashlib.sha256).hexdigest()
+
+def check_login_limit(request: Request, username: str):
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    cutoff = now - timedelta(minutes=5)
+    ip = request.client.host if request.client else "unknown"
+    keys = [(_attempt_key("ip", ip), 40), (_attempt_key("account", username.strip().lower()), 8)]
+    with _login_lock:
+        with engine.begin() as conn:
+            conn.execute(AuthAttempt.__table__.delete().where(AuthAttempt.created_at < cutoff))
+            for key, limit in keys:
+                count = conn.execute(select(__import__('sqlalchemy').func.count()).select_from(AuthAttempt).where(AuthAttempt.key == key)).scalar_one()
+                if count >= limit:
+                    raise HTTPException(429, "Too many authentication attempts; retry in five minutes")
+            conn.execute(AuthAttempt.__table__.insert(), [{"key": key, "created_at": now} for key, _ in keys])
+
+def clear_login_limit(request: Request, username: str):
+    # A valid password clears account-specific failures and refunds the IP slot this
+    # attempt reserved, so the IP budget counts failures only. Otherwise ordinary logins
+    # from a shared address (an office NAT, or 127.0.0.1 locally) exhaust it for everyone.
+    key = _attempt_key("account", username.strip().lower())
+    ip = request.client.host if request.client else "unknown"
+    ip_key = _attempt_key("ip", ip)
+    with _login_lock:
+        with engine.begin() as conn:
+            conn.execute(AuthAttempt.__table__.delete().where(AuthAttempt.key == key))
+            latest = conn.execute(select(AuthAttempt.id).where(AuthAttempt.key == ip_key)
+                                  .order_by(AuthAttempt.id.desc()).limit(1)).scalar()
+            if latest is not None:
+                conn.execute(AuthAttempt.__table__.delete().where(AuthAttempt.id == latest))
+
+@app.post("/api/auth/login")
+def login(body: LoginRequest, response: Response, request: Request, db: DBSession = Depends(get_db)):
+    check_login_limit(request, body.username)
+    user = db.scalar(select(User).where(User.username == body.username.strip().lower()))
+    try:
+        if not user:
+            raise VerifyMismatchError
+        ph.verify(user.password_hash, body.password)
+    except (VerifyMismatchError, ValueError):
+        # The attempted username is not stored: users sometimes type a password into that field.
+        audit(db, user.id if user else None, "LOGIN_FAILED", result="failure"); db.commit()
+        raise HTTPException(401, "Invalid username or password")
+    clear_login_limit(request, body.username)
+    if ph.check_needs_rehash(user.password_hash):
+        user.password_hash = ph.hash(body.password)
+    device_token = request.cookies.get("cipherdrop_device", "")
+    known = bool(device_token and db.scalar(select(TrustedDevice).where(TrustedDevice.user_id == user.id, TrustedDevice.token_hash == hash_token(device_token))))
+    create_session(response, user, db, request)
+    audit(db, user.id, "SESSION_CREATED")
+    notify(db, user.id, "Login from a trusted browser" if known else "New login from an untrusted browser")
+    db.commit()
+    return {"id": user.id, "username": user.username}
+
+@app.post("/api/auth/logout", status_code=204)
+def logout(request: Request, response: Response, db: DBSession = Depends(get_db)):
+    token = request.cookies.get(SESSION_COOKIE)
+    if token:
+        row = db.scalar(select(Session).where(Session.token_hash == hash_token(token)))
+        if row:
+            audit(db, row.user_id, "LOGOUT", str(row.id))
+            db.delete(row)
+            db.commit()
+    response.delete_cookie(SESSION_COOKIE, path="/")
+
+@app.get("/api/auth/me")
+def me(user: User = Depends(current_user)):
+    return {"id": user.id, "username": user.username}
+
+@app.get("/api/auth/csrf")
+def csrf_token(request: Request, user: User = Depends(current_user)):
+    return {"token": csrf_value(request.cookies[SESSION_COOKIE])}
+
+@app.get("/api/vault/material")
+def vault_material(user: User = Depends(current_user)):
+    return {
+        "vault_salt": user.vault_salt,
+        "vault_wrap_iv": user.vault_wrap_iv,
+        "wrapped_vault_key": user.wrapped_vault_key,
+        "kdf_iterations": user.kdf_iterations,
+    }
+
+@app.get("/api/files")
+def list_files(user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    rows = db.scalars(select(FileRecord).where(FileRecord.owner_id == user.id).order_by(FileRecord.created_at.desc())).all()
+    return [{
+        "id": r.id, "encrypted_filename": r.encrypted_filename, "filename_iv": r.filename_iv,
+        "file_iv": r.file_iv, "wrapped_dek": r.wrapped_dek, "dek_wrap_iv": r.dek_wrap_iv,
+        "size_bytes": r.size_bytes, "created_at": r.created_at,
+    } for r in rows]
+
+@app.post("/api/files", status_code=201)
+async def upload_file(
+    blob: UploadFile = File(...), encrypted_filename: str = Form(...), filename_iv: str = Form(...),
+    file_iv: str = Form(...), wrapped_dek: str = Form(...), dek_wrap_iv: str = Form(...),
+    user: User = Depends(current_user), db: DBSession = Depends(get_db),
+):
+    data = await blob.read(MAX_FILE_BYTES + 1)
+    if len(data) > MAX_FILE_BYTES:
+        raise HTTPException(413, "Encrypted file exceeds 100 MiB demo limit")
+    object_name = f"{uuid.uuid4().hex}.enc"
+    path = STORAGE / object_name
+    path.write_bytes(data)
+    row = FileRecord(
+        owner_id=user.id, object_name=object_name, encrypted_filename=encrypted_filename,
+        filename_iv=filename_iv, file_iv=file_iv, wrapped_dek=wrapped_dek,
+        dek_wrap_iv=dek_wrap_iv, size_bytes=len(data),
+    )
+    db.add(row)
+    try:
+        db.flush()
+        audit(db, user.id, "FILE_UPLOAD", str(row.id))
+        db.commit()
+        db.refresh(row)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    return {"id": row.id}
+
+@app.put("/api/files/{file_id}")
+async def replace_file(
+    file_id: int, blob: UploadFile = File(...), encrypted_filename: str = Form(...), filename_iv: str = Form(...),
+    file_iv: str = Form(...), wrapped_dek: str = Form(...), dek_wrap_iv: str = Form(...),
+    user: User = Depends(current_user), db: DBSession = Depends(get_db),
+):
+    row = db.scalar(select(FileRecord).where(FileRecord.id == file_id, FileRecord.owner_id == user.id))
+    if not row:
+        raise HTTPException(404, "File not found")
+    data = await blob.read(MAX_FILE_BYTES + 1)
+    if len(data) > MAX_FILE_BYTES:
+        raise HTTPException(413, "Encrypted file exceeds 100 MiB demo limit")
+
+    # Replacement uses fresh client-generated key material. Existing recipient grants
+    # are revoked because their wrapped DEKs refer to the old encrypted object.
+    new_object_name = f"{uuid.uuid4().hex}.enc"
+    new_path = STORAGE / new_object_name
+    old_path = STORAGE / row.object_name
+    new_path.write_bytes(data)
+    try:
+        for link in db.scalars(select(SecureLink).where(SecureLink.file_id == row.id)).all():
+            db.delete(link)
+        for share in list(row.shares):
+            db.delete(share)
+        row.object_name = new_object_name
+        row.encrypted_filename = encrypted_filename
+        row.filename_iv = filename_iv
+        row.file_iv = file_iv
+        row.wrapped_dek = wrapped_dek
+        row.dek_wrap_iv = dek_wrap_iv
+        row.size_bytes = len(data)
+        audit(db, user.id, "FILE_REPLACED", str(row.id))
+        db.commit()
+    except Exception:
+        db.rollback()
+        new_path.unlink(missing_ok=True)
+        raise
+    old_path.unlink(missing_ok=True)
+    return {"id": row.id, "shares_revoked": True}
+
+@app.delete("/api/files/{file_id}", status_code=204)
+def delete_file(file_id: int, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    row = db.scalar(select(FileRecord).where(FileRecord.id == file_id, FileRecord.owner_id == user.id))
+    if not row:
+        raise HTTPException(404, "File not found")
+    path = STORAGE / row.object_name
+    audit(db, user.id, "FILE_DELETED", str(row.id))
+    for link in db.scalars(select(SecureLink).where(SecureLink.file_id == row.id)).all():
+        db.delete(link)
+    db.delete(row)  # FileShare rows are removed by the relationship cascade.
+    db.commit()
+    path.unlink(missing_ok=True)
+
+@app.get("/api/files/{file_id}/blob")
+def download_blob(file_id: int, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    row = db.scalar(select(FileRecord).where(FileRecord.id == file_id, FileRecord.owner_id == user.id))
+    if not row:
+        raise HTTPException(404, "File not found")
+    path = STORAGE / row.object_name
+    if not path.exists():
+        raise HTTPException(410, "Encrypted object is missing")
+    audit(db, user.id, "FILE_DOWNLOADED", str(row.id)); db.commit()
+    return FileResponse(path, media_type="application/octet-stream", filename=f"{file_id}.enc")
+
+
+@app.get("/api/sharing/profile")
+def get_crypto_profile(user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    profile = db.scalar(select(UserCryptoProfile).where(UserCryptoProfile.user_id == user.id))
+    if not profile:
+        return {"configured": False}
+    return {
+        "configured": True,
+        "public_key_jwk": profile.public_key_jwk,
+        "encrypted_private_key": profile.encrypted_private_key,
+        "private_key_iv": profile.private_key_iv,
+    }
+
+@app.post("/api/sharing/profile", status_code=201)
+def create_crypto_profile(body: CryptoProfileRequest, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    existing = db.scalar(select(UserCryptoProfile).where(UserCryptoProfile.user_id == user.id))
+    if existing:
+        raise HTTPException(409, "Sharing keys are already configured")
+    profile = UserCryptoProfile(
+        user_id=user.id,
+        public_key_jwk=body.public_key_jwk,
+        encrypted_private_key=body.encrypted_private_key,
+        private_key_iv=body.private_key_iv,
+    )
+    db.add(profile)
+    db.commit()
+    return {"configured": True}
+
+@app.get("/api/users/{username}/public-key")
+def recipient_public_key(username: str, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    target = db.scalar(select(User).where(User.username == username.strip().lower()))
+    if not target or target.id == user.id:
+        raise HTTPException(404, "Recipient not found")
+    profile = db.scalar(select(UserCryptoProfile).where(UserCryptoProfile.user_id == target.id))
+    if not profile:
+        raise HTTPException(409, "Recipient has not initialized encrypted sharing")
+    return {"username": target.username, "public_key_jwk": profile.public_key_jwk}
+
+def _is_expired(share: FileShare) -> bool:
+    if not share.expires_at:
+        return False
+    expiry = share.expires_at
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    return expiry <= datetime.now(timezone.utc)
+
+def _delete_share_tree(db: DBSession, share: FileShare):
+    children = db.scalars(select(FileShare).where(FileShare.parent_share_id == share.id)).all()
+    for child in children:
+        _delete_share_tree(db, child)
+    db.delete(share)
+
+def _share_payload(share: FileShare, db: DBSession):
+    file_row = db.get(FileRecord, share.file_id)
+    owner = db.get(User, share.owner_id)
+    grantor = db.get(User, share.grantor_id or share.owner_id)
+    grantor_profile = db.scalar(select(UserCryptoProfile).where(UserCryptoProfile.user_id == (share.grantor_id or share.owner_id)))
+    if not file_row or not owner or not grantor or not grantor_profile:
+        return None
+    return {
+        "id": share.id, "file_id": file_row.id,
+        "owner_username": owner.username, "grantor_username": grantor.username,
+        "sender_public_key_jwk": grantor_profile.public_key_jwk,
+        "encrypted_filename": share.encrypted_filename, "filename_iv": share.filename_iv,
+        "file_iv": file_row.file_iv, "wrapped_dek": share.wrapped_dek,
+        "dek_wrap_iv": share.dek_wrap_iv, "hkdf_salt": share.hkdf_salt,
+        "size_bytes": file_row.size_bytes, "created_at": share.created_at,
+        "can_view": bool(share.can_view), "can_download": bool(share.can_download),
+        "can_reshare": bool(share.can_reshare), "expires_at": share.expires_at,
+    }
+
+@app.post("/api/files/{file_id}/shares", status_code=201)
+def create_share(file_id: int, body: ShareRequest, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    file_row = db.scalar(select(FileRecord).where(FileRecord.id == file_id, FileRecord.owner_id == user.id))
+    if not file_row:
+        raise HTTPException(404, "File not found")
+    recipient = db.scalar(select(User).where(User.username == body.recipient_username.strip().lower()))
+    if not recipient or recipient.id == user.id:
+        raise HTTPException(404, "Recipient not found")
+    profile = db.scalar(select(UserCryptoProfile).where(UserCryptoProfile.user_id == recipient.id))
+    if not profile:
+        raise HTTPException(409, "Recipient has not initialized encrypted sharing")
+    existing = db.scalar(select(FileShare).where(FileShare.file_id == file_id, FileShare.recipient_id == recipient.id))
+    if existing:
+        raise HTTPException(409, "File is already shared with this user")
+    if body.expires_at and body.expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(400, "Expiration must be in the future")
+    share = FileShare(
+        file_id=file_id, owner_id=user.id, recipient_id=recipient.id, grantor_id=user.id,
+        wrapped_dek=body.wrapped_dek, dek_wrap_iv=body.dek_wrap_iv,
+        encrypted_filename=body.encrypted_filename, filename_iv=body.filename_iv,
+        hkdf_salt=body.hkdf_salt, can_view=body.can_view, can_download=body.can_download,
+        can_reshare=body.can_reshare, expires_at=body.expires_at,
+    )
+    db.add(share); db.flush(); audit(db, user.id, "SHARE_CREATED", str(share.id)); db.commit(); db.refresh(share)
+    return {"id": share.id, "recipient": recipient.username}
+
+@app.get("/api/files/{file_id}/shares")
+def manage_file_shares(file_id: int, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    file_row = db.scalar(select(FileRecord).where(FileRecord.id == file_id, FileRecord.owner_id == user.id))
+    if not file_row:
+        raise HTTPException(404, "File not found")
+    shares = db.scalars(select(FileShare).where(FileShare.file_id == file_id, FileShare.owner_id == user.id).order_by(FileShare.created_at.desc())).all()
+    result = []
+    for share in shares:
+        recipient = db.get(User, share.recipient_id)
+        grantor = db.get(User, share.grantor_id or share.owner_id)
+        if recipient and grantor:
+            result.append({
+                "id": share.id, "recipient_username": recipient.username,
+                "grantor_username": grantor.username, "can_view": bool(share.can_view),
+                "can_download": bool(share.can_download), "can_reshare": bool(share.can_reshare),
+                "expires_at": share.expires_at, "expired": _is_expired(share),
+                "created_at": share.created_at, "is_direct": share.parent_share_id is None,
+            })
+    return result
+
+@app.delete("/api/files/{file_id}/shares/{share_id}", status_code=204)
+def revoke_share(file_id: int, share_id: int, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    file_row = db.scalar(select(FileRecord).where(FileRecord.id == file_id, FileRecord.owner_id == user.id))
+    if not file_row:
+        raise HTTPException(404, "File not found")
+    share = db.scalar(select(FileShare).where(FileShare.id == share_id, FileShare.file_id == file_id, FileShare.owner_id == user.id))
+    if not share:
+        raise HTTPException(404, "Share not found")
+    audit(db, user.id, "SHARE_REVOKED", str(share.id))
+    _delete_share_tree(db, share)
+    db.commit()
+
+@app.get("/api/shared")
+def shared_with_me(user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    shares = db.scalars(select(FileShare).where(FileShare.recipient_id == user.id, FileShare.can_view == True).order_by(FileShare.created_at.desc())).all()
+    result = []
+    for share in shares:
+        if _is_expired(share):
+            continue
+        payload = _share_payload(share, db)
+        if payload:
+            result.append(payload)
+    return result
+
+@app.post("/api/shared/{share_id}/reshare", status_code=201)
+def reshare_file(share_id: int, body: ReshareRequest, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    parent = db.scalar(select(FileShare).where(FileShare.id == share_id, FileShare.recipient_id == user.id))
+    if not parent or _is_expired(parent) or not parent.can_reshare:
+        raise HTTPException(404, "Share not found")
+    recipient = db.scalar(select(User).where(User.username == body.recipient_username.strip().lower()))
+    if not recipient or recipient.id in {user.id, parent.owner_id}:
+        raise HTTPException(404, "Recipient not found")
+    profile = db.scalar(select(UserCryptoProfile).where(UserCryptoProfile.user_id == recipient.id))
+    if not profile:
+        raise HTTPException(409, "Recipient has not initialized encrypted sharing")
+    existing = db.scalar(select(FileShare).where(FileShare.file_id == parent.file_id, FileShare.recipient_id == recipient.id))
+    if existing:
+        raise HTTPException(409, "File is already shared with this user")
+    expires_at = body.expires_at
+    if parent.expires_at and (expires_at is None or expires_at > parent.expires_at.replace(tzinfo=timezone.utc)):
+        expires_at = parent.expires_at.replace(tzinfo=timezone.utc)
+    if expires_at and expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(400, "Expiration must be in the future")
+    child = FileShare(
+        file_id=parent.file_id, owner_id=parent.owner_id, recipient_id=recipient.id,
+        grantor_id=user.id, parent_share_id=parent.id,
+        wrapped_dek=body.wrapped_dek, dek_wrap_iv=body.dek_wrap_iv,
+        encrypted_filename=body.encrypted_filename, filename_iv=body.filename_iv,
+        hkdf_salt=body.hkdf_salt, can_view=body.can_view,
+        can_download=body.can_download and parent.can_download,
+        can_reshare=body.can_reshare and parent.can_reshare, expires_at=expires_at,
+    )
+    db.add(child); db.flush(); audit(db, user.id, "SHARE_RESHARED", str(child.id)); db.commit(); db.refresh(child)
+    return {"id": child.id, "recipient": recipient.username}
+
+@app.get("/api/shared/{share_id}/blob")
+def download_shared_blob(share_id: int, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    share = db.scalar(select(FileShare).where(FileShare.id == share_id, FileShare.recipient_id == user.id))
+    if not share or _is_expired(share) or not share.can_download:
+        raise HTTPException(404, "Shared file not found")
+    file_row = db.get(FileRecord, share.file_id)
+    if not file_row:
+        raise HTTPException(410, "Shared file record is missing")
+    path = STORAGE / file_row.object_name
+    if not path.exists():
+        raise HTTPException(410, "Encrypted object is missing")
+    audit(db, user.id, "SHARE_DOWNLOADED", str(share.id)); db.commit()
+    return FileResponse(path, media_type="application/octet-stream", filename=f"shared-{share_id}.enc")
+
+# v0.5 — authenticated session management
+@app.get('/api/security/sessions')
+def list_sessions(request: Request, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    rows = db.scalars(select(Session).where(Session.user_id == user.id).order_by(Session.created_at.desc())).all()
+    return [{'id': r.id, 'created_at': r.created_at, 'last_seen_at': r.last_seen_at,
+             'expires_at': r.expires_at, 'user_agent': r.user_agent, 'ip_address': r.ip_address,
+             'current': r.id == request.state.session_id} for r in rows]
+
+@app.delete('/api/security/sessions/{session_id}', status_code=204)
+def revoke_session(session_id: int, request: Request, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    row = db.scalar(select(Session).where(Session.id == session_id, Session.user_id == user.id))
+    if not row:
+        raise HTTPException(404, 'Session not found')
+    # Revoking another session needs the same step-up as revoke-others; otherwise a stolen
+    # session could sign the owner out everywhere one session at a time.
+    if session_id != request.state.session_id:
+        require_step_up(request)
+    audit(db, user.id, 'SESSION_REVOKED', str(row.id))
+    notify(db, user.id, "A session was revoked")
+    db.delete(row)
+    db.commit()
+
+@app.post('/api/security/sessions/revoke-others')
+def revoke_other_sessions(request: Request, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    require_step_up(request)
+    rows = db.scalars(select(Session).where(Session.user_id == user.id, Session.id != request.state.session_id)).all()
+    for row in rows:
+        db.delete(row)
+    audit(db, user.id, 'OTHER_SESSIONS_REVOKED', str(len(rows)))
+    notify(db, user.id, f'{len(rows)} other sessions were revoked')
+    db.commit()
+    return {'revoked': len(rows)}
+
+# v0.6 — read-only user activity + chain verification
+@app.get('/api/security/activity')
+def security_activity(user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    rows = db.scalars(select(AuditEvent).where(AuditEvent.user_id == user.id).order_by(AuditEvent.id.desc()).limit(150)).all()
+    return [{'id': r.id, 'created_at': r.created_at, 'event_type': r.event_type,
+             'resource_id': r.resource_id, 'result': r.result} for r in rows]
+
+@app.get('/api/security/audit/verify')
+def audit_integrity(user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    # The chain covers every user's events, so don't reveal the system-wide count.
+    result = verify_audit(db)
+    result.pop("checked", None)
+    return result
+
+# v0.7 — encrypted links. Secret is only in browser URL fragment, never server request.
+from pydantic import BaseModel, Field
+
+class LinkCreate(BaseModel):
+    @__import__("pydantic").field_validator("expires_at")
+    @classmethod
+    def timezone_required(cls, value):
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("Expiry must include a timezone offset")
+        return value
+    encrypted_filename: str = Field(min_length=1, max_length=8192)
+    filename_iv: str = Field(min_length=8, max_length=128)
+    wrapped_dek: str = Field(min_length=20, max_length=8192)
+    dek_wrap_iv: str = Field(min_length=8, max_length=128)
+    expires_at: datetime | None = None
+    max_downloads: int = Field(ge=1, le=100)
+
+@app.post('/api/files/{file_id}/links', status_code=201)
+def create_link(file_id: int, body: LinkCreate, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    file_row = db.scalar(select(FileRecord).where(FileRecord.id == file_id, FileRecord.owner_id == user.id))
+    if not file_row:
+        raise HTTPException(404, 'File not found')
+    if body.expires_at and body.expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(400, 'Expiration must be in the future')
+    raw = secrets.token_urlsafe(32)
+    link = SecureLink(file_id=file_id, owner_id=user.id, token_hash=hash_token(raw),
+                      encrypted_filename=body.encrypted_filename, filename_iv=body.filename_iv,
+                      wrapped_dek=body.wrapped_dek, dek_wrap_iv=body.dek_wrap_iv,
+                      expires_at=body.expires_at, max_downloads=body.max_downloads)
+    db.add(link); db.flush(); audit(db, user.id, 'LINK_CREATED', str(link.id)); db.commit()
+    return {'id': link.id, 'token': raw}
+
+@app.get('/api/files/{file_id}/links')
+def list_links(file_id: int, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    if not db.scalar(select(FileRecord).where(FileRecord.id == file_id, FileRecord.owner_id == user.id)):
+        raise HTTPException(404, 'File not found')
+    rows = db.scalars(select(SecureLink).where(SecureLink.file_id == file_id, SecureLink.owner_id == user.id)).all()
+    return [{'id': r.id, 'expires_at': r.expires_at, 'download_count': r.download_count,
+             'max_downloads': r.max_downloads} for r in rows]
+
+@app.delete('/api/files/{file_id}/links/{link_id}', status_code=204)
+def revoke_link(file_id: int, link_id: int, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    row = db.scalar(select(SecureLink).where(SecureLink.id == link_id, SecureLink.file_id == file_id, SecureLink.owner_id == user.id))
+    if not row:
+        raise HTTPException(404, 'Link not found')
+    audit(db, user.id, 'LINK_REVOKED', str(row.id)); db.delete(row); db.commit()
+
+def _public_link(db, token):
+    link = db.scalar(select(SecureLink).where(SecureLink.token_hash == hash_token(token)))
+    if not link or (link.expires_at and link.expires_at.replace(tzinfo=timezone.utc) <= datetime.now(timezone.utc)) or link.download_count >= link.max_downloads:
+        raise HTTPException(404, 'Link unavailable')
+    row = db.get(FileRecord, link.file_id)
+    if not row:
+        raise HTTPException(404, 'Link unavailable')
+    return link, row
+
+@app.get('/api/public/links/{token}')
+def public_link_metadata(token: str, db: DBSession = Depends(get_db)):
+    link, row = _public_link(db, token)
+    return {'encrypted_filename': link.encrypted_filename, 'filename_iv': link.filename_iv,
+            'wrapped_dek': link.wrapped_dek, 'dek_wrap_iv': link.dek_wrap_iv,
+            'file_iv': row.file_iv, 'size_bytes': row.size_bytes}
+
+@app.post('/api/public/links/{token}/download')
+def public_link_download(token: str, db: DBSession = Depends(get_db)):
+    link, row = _public_link(db, token)
+    path = STORAGE / row.object_name
+    if not path.exists():
+        raise HTTPException(404, 'Link unavailable')
+    # Atomic conditional update prevents concurrent requests from exceeding the limit.
+    result = db.execute(update(SecureLink).where(SecureLink.id == link.id,
+                        SecureLink.download_count < SecureLink.max_downloads).values(
+                        download_count=SecureLink.download_count + 1))
+    if result.rowcount != 1:
+        db.rollback(); raise HTTPException(404, 'Link unavailable')
+    audit(db, link.owner_id, 'LINK_DOWNLOADED', str(link.id)); db.commit()
+    return FileResponse(path, media_type='application/octet-stream', filename='encrypted-file.enc')
+
+# v0.8–v1.0 security center and device controls
+from pydantic import BaseModel as _BaseModel
+
+class PasswordConfirmation(_BaseModel):
+    password: str
+
+def require_step_up(request: Request):
+    row = getattr(request.state, "session_row", None)
+    until = row.step_up_until if row else None
+    if until is None or until.replace(tzinfo=timezone.utc) <= datetime.now(timezone.utc):
+        raise HTTPException(403, "Reauthentication required. Confirm your account password in Security Center.")
+
+@app.post("/api/security/step-up")
+def step_up(body: PasswordConfirmation, request: Request, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    check_login_limit(request, user.username + ":stepup")
+    try:
+        if not ph.verify(user.password_hash, body.password):
+            raise HTTPException(401, "Invalid password")
+    except (VerifyMismatchError, ValueError):
+        audit(db, user.id, "STEP_UP_FAILED", result="failure"); db.commit()
+        raise HTTPException(401, "Invalid password")
+    clear_login_limit(request, user.username + ":stepup")
+    request.state.session_row.step_up_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+    audit(db, user.id, "STEP_UP_SUCCESS")
+    db.commit()
+    return {"valid_for_seconds": 300}
+
+@app.get("/api/security/overview")
+def security_overview(request: Request, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    sessions = db.scalars(select(Session).where(Session.user_id == user.id)).all()
+    devices = db.scalars(select(TrustedDevice).where(TrustedDevice.user_id == user.id)).all()
+    unread = db.scalars(select(SecurityNotification).where(SecurityNotification.user_id == user.id, SecurityNotification.read_at.is_(None))).all()
+    return {"sessions": len(sessions), "trusted_devices": len(devices), "unread_notifications": len(unread), "step_up_active": bool(request.state.session_row.step_up_until and request.state.session_row.step_up_until.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc))}
+
+DEVICE_COOKIE = "cipherdrop_device"
+
+def notify(db: DBSession, user_id: int, message: str):
+    db.add(SecurityNotification(user_id=user_id, message=message[:300]))
+
+@app.post("/api/security/devices/trust", status_code=201)
+def trust_device(request: Request, response: Response, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    require_step_up(request)
+    old = request.cookies.get(DEVICE_COOKIE)
+    if old:
+        previous = db.scalar(select(TrustedDevice).where(TrustedDevice.user_id == user.id, TrustedDevice.token_hash == hash_token(old)))
+        if previous:
+            db.delete(previous)
+            db.flush()
+    token = secrets.token_urlsafe(32)
+    device = TrustedDevice(user_id=user.id, token_hash=hash_token(token), label=request.headers.get("user-agent", "Browser")[:200])
+    db.add(device)
+    audit(db, user.id, "DEVICE_TRUSTED")
+    notify(db, user.id, "A browser was marked as trusted")
+    db.commit()
+    response.set_cookie(DEVICE_COOKIE, token, httponly=True, secure=COOKIE_SECURE, samesite="strict", max_age=60*60*24*90, path="/")
+    return {"id": device.id}
+
+@app.get("/api/security/devices")
+def list_devices(request: Request, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    token = request.cookies.get(DEVICE_COOKIE, "")
+    rows = db.scalars(select(TrustedDevice).where(TrustedDevice.user_id == user.id).order_by(TrustedDevice.created_at.desc())).all()
+    return [{"id": x.id, "label": x.label, "created_at": x.created_at, "current": bool(token and hmac.compare_digest(x.token_hash, hash_token(token)))} for x in rows]
+
+@app.delete("/api/security/devices/{device_id}", status_code=204)
+def untrust_device(device_id: int, request: Request, response: Response, user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    require_step_up(request)
+    row = db.scalar(select(TrustedDevice).where(TrustedDevice.id == device_id, TrustedDevice.user_id == user.id))
+    if not row:
+        raise HTTPException(404, "Device not found")
+    current = request.cookies.get(DEVICE_COOKIE, "")
+    if current and hmac.compare_digest(row.token_hash, hash_token(current)):
+        response.delete_cookie(DEVICE_COOKIE, path="/")
+    db.delete(row)
+    audit(db, user.id, "DEVICE_UNTRUSTED")
+    notify(db, user.id, "A trusted browser was removed")
+    db.commit()
+
+@app.get("/api/security/notifications")
+def notifications(user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    rows = db.scalars(select(SecurityNotification).where(SecurityNotification.user_id == user.id).order_by(SecurityNotification.id.desc()).limit(50)).all()
+    return [{"id": r.id, "message": r.message, "created_at": r.created_at, "read": r.read_at is not None} for r in rows]
+
+@app.post("/api/security/notifications/read")
+def mark_notifications_read(user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    db.execute(update(SecurityNotification).where(SecurityNotification.user_id == user.id, SecurityNotification.read_at.is_(None)).values(read_at=datetime.now(timezone.utc)))
+    db.commit()
+    return {"ok": True}
+
+
+# Passkeys authenticate the account, not the separate encrypted vault. The
+# private authenticator key remains on the user's device / passkey provider.
+# WebAuthn protocol parsing and signature verification use py_webauthn.
+class PasskeyBegin(BaseModel):
+    username: str = Field(min_length=3, max_length=64)
+
+class PasskeyFinish(BaseModel):
+    flow: str = Field(min_length=20, max_length=200)
+    credential: dict
+
+class PasskeyRename(BaseModel):
+    label: str = Field(min_length=1, max_length=120)
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
+
+def _from_b64url(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + '=' * (-len(value) % 4))
+
+def _passkey_origin(request: Request) -> tuple[str, str]:
+    # Origin and RP ID must exactly match the browser's effective site.
+    # Only localhost is supported for local WebAuthn testing, never remote HTTP.
+    if PRODUCTION:
+        url = urlsplit(PUBLIC_ORIGIN)
+        if not url.hostname or url.scheme != 'https':
+            raise HTTPException(503, 'Passkeys require a configured HTTPS origin')
+        return PUBLIC_ORIGIN, url.hostname
+    origin = request.headers.get('origin', '')
+    if origin not in ('http://localhost:5173', 'https://localhost'):
+        raise HTTPException(400, 'For local passkeys, open http://localhost:5173 or https://localhost')
+    return origin, 'localhost'
+
+def _webauthn():
+    try:
+        from webauthn import (generate_registration_options, verify_registration_response,
+                             generate_authentication_options, verify_authentication_response,
+                             options_to_json)
+        from webauthn.helpers.structs import (PublicKeyCredentialDescriptor,
+             AuthenticatorSelectionCriteria, UserVerificationRequirement, ResidentKeyRequirement)
+        return (generate_registration_options, verify_registration_response,
+                generate_authentication_options, verify_authentication_response,
+                options_to_json, PublicKeyCredentialDescriptor, AuthenticatorSelectionCriteria,
+                UserVerificationRequirement, ResidentKeyRequirement)
+    except ImportError as error:
+        raise HTTPException(503, 'WebAuthn dependencies are not installed; run make') from error
+
+def _new_passkey_flow(db: DBSession, user_id: int, challenge: bytes, purpose: str,
+                      origin: str, session_hash: str | None = None) -> str:
+    flow = secrets.token_urlsafe(32)
+    db.add(PasskeyChallenge(token_hash=hash_token(flow), user_id=user_id,
+         challenge_b64=_b64url(challenge), purpose=purpose, origin=origin,
+         session_hash=session_hash, expires_at=datetime.now(timezone.utc) + timedelta(minutes=5)))
+    db.commit()
+    return flow
+
+def _consume_passkey_flow(db: DBSession, flow: str, purpose: str, origin: str,
+                          user_id: int | None = None, session_hash: str | None = None):
+    row = db.scalar(select(PasskeyChallenge).where(PasskeyChallenge.token_hash == hash_token(flow)))
+    # Consume challenge BEFORE verification, so retries and races cannot reuse it.
+    if row:
+        result = (row.user_id, _from_b64url(row.challenge_b64))
+        valid = (row.purpose == purpose and row.origin == origin and
+                 row.expires_at.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc) and
+                 (user_id is None or row.user_id == user_id) and
+                 (session_hash is None or row.session_hash == session_hash))
+        db.delete(row)
+        db.commit()
+        if valid:
+            return result
+    raise HTTPException(400, 'Passkey request expired or invalid; try again')
+
+@app.get('/api/security/passkeys')
+def list_passkeys(user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    rows = db.scalars(select(PasskeyCredential).where(PasskeyCredential.user_id == user.id)
+                      .order_by(PasskeyCredential.id.desc())).all()
+    return [{'id': p.id, 'label': p.label, 'created_at': p.created_at} for p in rows]
+
+@app.post('/api/security/passkeys/register/begin')
+def passkey_registration_begin(request: Request, user: User = Depends(current_user),
+                               db: DBSession = Depends(get_db)):
+    require_step_up(request)
+    origin, rp_id = _passkey_origin(request)
+    gen, _, _, _, to_json, descriptor, selection, uv, resident = _webauthn()
+    stored = db.scalars(select(PasskeyCredential).where(PasskeyCredential.user_id == user.id)).all()
+    options = gen(rp_id=rp_id, rp_name='CipherDrop', user_id=str(user.id).encode(),
+                  user_name=user.username,
+                  exclude_credentials=[descriptor(id=_from_b64url(p.credential_id)) for p in stored],
+                  authenticator_selection=selection(user_verification=uv.REQUIRED,
+                                                    resident_key=resident.PREFERRED))
+    token = request.cookies.get(SESSION_COOKIE, '')
+    flow = _new_passkey_flow(db, user.id, options.challenge, 'register', origin, hash_token(token))
+    return {'flow': flow, 'options': json.loads(to_json(options))}
+
+@app.post('/api/security/passkeys/register/finish', status_code=201)
+def passkey_registration_finish(body: PasskeyFinish, request: Request,
+                                user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    require_step_up(request)
+    origin, rp_id = _passkey_origin(request)
+    _, verify, _, _, _, _, _, _, _ = _webauthn()
+    _, challenge = _consume_passkey_flow(db, body.flow, 'register', origin, user.id,
+                                        hash_token(request.cookies[SESSION_COOKIE]))
+    try:
+        result = verify(credential=body.credential, expected_challenge=challenge,
+                        expected_rp_id=rp_id, expected_origin=origin, require_user_verification=True)
+    except Exception as exc:
+        raise HTTPException(400, 'Passkey registration verification failed') from exc
+    encoded_id = _b64url(result.credential_id)
+    if db.scalar(select(PasskeyCredential).where(PasskeyCredential.credential_id == encoded_id)):
+        raise HTTPException(409, 'Passkey already registered')
+    record = PasskeyCredential(user_id=user.id, credential_id=encoded_id,
+                               public_key=_b64url(result.credential_public_key),
+                               sign_count=result.sign_count, label='Passkey')
+    db.add(record); db.flush(); audit(db, user.id, 'PASSKEY_REGISTERED', str(record.id)); db.commit()
+    return {'id': record.id}
+
+@app.post('/api/auth/passkey/begin')
+def passkey_login_begin(body: PasskeyBegin, request: Request, db: DBSession = Depends(get_db)):
+    check_login_limit(request, body.username.strip().lower() + ':passkey')
+    origin, rp_id = _passkey_origin(request)
+    user = db.scalar(select(User).where(User.username == body.username.strip().lower()))
+    credentials = (db.scalars(select(PasskeyCredential).where(PasskeyCredential.user_id == user.id)).all()
+                   if user else [])
+    if not credentials:
+        raise HTTPException(400, 'No passkeys available for this account')
+    _, _, gen, _, to_json, descriptor, _, uv, _ = _webauthn()
+    options = gen(rp_id=rp_id, user_verification=uv.REQUIRED,
+                  allow_credentials=[descriptor(id=_from_b64url(p.credential_id)) for p in credentials])
+    flow = _new_passkey_flow(db, user.id, options.challenge, 'login', origin)
+    return {'flow': flow, 'options': json.loads(to_json(options))}
+
+@app.post('/api/auth/passkey/finish')
+def passkey_login_finish(body: PasskeyFinish, response: Response,
+                         request: Request, db: DBSession = Depends(get_db)):
+    origin, rp_id = _passkey_origin(request)
+    _, _, _, verify, _, _, _, _, _ = _webauthn()
+    user_id, challenge = _consume_passkey_flow(db, body.flow, 'login', origin)
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(401, 'Passkey authentication failed')
+    check_login_limit(request, user.username + ':passkey')
+    raw_id = body.credential.get('rawId')
+    if not isinstance(raw_id, str):
+        raise HTTPException(400, 'Invalid passkey credential')
+    record = db.scalar(select(PasskeyCredential).where(PasskeyCredential.credential_id == raw_id,
+                          PasskeyCredential.user_id == user.id))
+    if not record:
+        raise HTTPException(401, 'Passkey authentication failed')
+    try:
+        verified = verify(credential=body.credential, expected_challenge=challenge,
+                          expected_rp_id=rp_id, expected_origin=origin,
+                          credential_public_key=_from_b64url(record.public_key),
+                          credential_current_sign_count=record.sign_count,
+                          require_user_verification=True)
+    except Exception as exc:
+        raise HTTPException(401, 'Passkey authentication failed') from exc
+    record.sign_count = verified.new_sign_count
+    clear_login_limit(request, user.username + ':passkey')
+    create_session(response, user, db, request)
+    audit(db, user.id, 'PASSKEY_LOGIN', str(record.id))
+    notify(db, user.id, 'Login with a passkey')
+    db.commit()
+    return {'id': user.id, 'username': user.username}
+
+@app.delete('/api/security/passkeys/{credential_id}', status_code=204)
+def delete_passkey(credential_id: int, request: Request,
+                   user: User = Depends(current_user), db: DBSession = Depends(get_db)):
+    require_step_up(request)
+    record = db.scalar(select(PasskeyCredential).where(PasskeyCredential.id == credential_id,
+                      PasskeyCredential.user_id == user.id))
+    if not record:
+        raise HTTPException(404, 'Passkey not found')
+    db.delete(record)
+    audit(db, user.id, 'PASSKEY_REMOVED', str(credential_id))
+    notify(db, user.id, 'A passkey was removed')
+    db.commit()

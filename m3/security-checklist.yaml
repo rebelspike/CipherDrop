@@ -1,54 +1,43 @@
-# ============================================================
-# Security Self-Checklist — CSCI 4531/6531 Milestone 3
-# Fill this out honestly. Used for AI-assisted pre-grading.
-# ============================================================
-
 security_properties:
-
   encryption:
-    implemented: false
-    mechanism: ""                          # e.g., "AES-256-GCM via Python cryptography library"
-    keys_stored_securely: false            # keys not in plaintext in DB or config
-    plaintext_ever_logged: true            # set to false only if you verified this
-    iv_unique_per_operation: false         # random IV generated per encryption call
-
+    implemented: true
+    mechanism: AES-256-GCM in browser (Web Crypto API); per-file DEK wrapping
+    keys_stored_securely: true
+    plaintext_ever_logged: false
+    iv_unique_per_operation: true
   accounts:
-    implemented: false
-    password_hashing: ""                   # e.g., "argon2id" or "bcrypt"
-    rate_limiting: false                   # login attempts are rate-limited
-    session_invalidation_on_logout: false  # server-side session invalidated
-    tokens_httponly: false                 # session cookies use HttpOnly flag
-
+    implemented: true
+    password_hashing: argon2id
+    rate_limiting: true
+    session_invalidation_on_logout: true
+    tokens_httponly: true
   rbac:
-    implemented: false
-    roles_defined: []                      # e.g., ["admin", "viewer"]
-    server_side_enforcement: false         # role checks happen on server, not just client
-    privilege_escalation_tested: false     # tested that lower role cannot access higher role resources
-
+    implemented: true
+    roles_defined:
+    - file owner
+    - 'share recipient: view/download/reshare grants'
+    server_side_enforcement: true
+    privilege_escalation_tested: true
   networking:
-    implemented: false
-    tls_enforced: false                    # all traffic over TLS
-    certificates_validated: false
-
+    implemented: true
+    tls_enforced: false
+    certificates_validated: true
   audit_log:
-    implemented: false
-    log_format: ""                         # e.g., "append-only SQLite table with timestamp + user + action"
-    tamper_evident: false                  # can log entries be deleted or modified?
-    sensitive_data_excluded: false         # no passwords or key material in log entries
-
+    implemented: true
+    log_format: SQLite security events with HMAC-SHA-256 chain
+    tamper_evident: true
+    sensitive_data_excluded: true
 ux_review:
-  primary_flows_screenshots_included: true   # set to true when report has screenshots
-  error_messages_reviewed: false             # checked that errors don't leak internal state
-  secure_defaults_verified: false            # default settings are secure (e.g., HTTPS, strict cookies)
-  cli_help_complete: false                   # or "N/A" if no CLI
-
+  primary_flows_screenshots_included: true
+  error_messages_reviewed: false
+  secure_defaults_verified: false
+  cli_help_complete: N/A
 documentation:
-  readme_complete: false
-  setup_reproducible: false                  # tested that SETUP.md works from scratch
-  audit_instructions_complete: false         # AUDIT.md lets someone reproduce the audit
-  dependency_scan_run: false
-
+  readme_complete: true
+  setup_reproducible: false
+  audit_instructions_complete: true
+  dependency_scan_run: true
 known_limitations:
-  - description: ""                          # describe each residual risk honestly
-    severity: ""                             # low | medium | high
-    reason_accepted: ""                      # why you accepted this risk
+- description: 'Local Host only'
+  severity: 'Low'
+  reason_accepted: 'The application is designed to run in a local development environment and is not intended for production use yet'

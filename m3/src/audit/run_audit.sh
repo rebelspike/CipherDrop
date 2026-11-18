@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Runs the full CipherDrop security audit against a THROWAWAY data folder.
 # Starts the backend (port 8000) and the real Vite dev server (port 5173), runs
-# audit_tests.py and redteam_tests.py, saves logs to m3/src/audit/results/, then stops
+# audit_tests.py and redteam_tests.py, saves logs to src/audit/results/, then stops
 # both servers and deletes the throwaway data. Real CipherDrop data is never touched.
 # Prerequisite: run `make` once from the project root (creates .venv and node_modules).
 set -euo pipefail
 
 AUDIT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(cd "$AUDIT_DIR/../../.." && pwd)"
+ROOT="$(cd "$AUDIT_DIR/../.." && pwd)"
 PY="${PY:-$ROOT/.venv/bin/python}"
 VITE_BIN="$ROOT/frontend/node_modules/.bin/vite"
 RESULTS="$AUDIT_DIR/results"
